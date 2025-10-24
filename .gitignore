@@ -219,3 +219,7 @@ __marimo__/
 # vcode
 
 .vscode/
+
+
+finetune_runs/
+dataset.json

@@ -87,3 +87,62 @@ def draw_annotations(img_bgr: np.ndarray,
             cv2.putText(out, label, (x1 + 3, y1 + th + 2),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
     return out
+
+def find_parallel(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray):
+    """Find the parallel line of p1 and p2 passing through p3."""
+    # Get the line coefficients (Ax + B = y) for line p1p2
+    A = (p2[1] - p1[1]) / (p2[0] - p1[0])
+    if A == 0:
+        A = 1e-6  # avoid division by zero
+    B = p3[1] - A * p3[0]
+    return A, B
+
+def find_orthogonal_projection(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> np.ndarray:
+    A,B = find_parallel(p1, p2, p3)
+
+    A_ortho = -1 / A
+    B1_ortho = p1[1] - A_ortho * p1[0]
+    B2_ortho = p2[1] - A_ortho * p2[0]
+
+    # Solve for intersection
+    x1_proj = (B1_ortho - B) / (A - A_ortho)
+    y1_proj = A * x1_proj + B
+
+    x2_proj = (B2_ortho - B) / (A - A_ortho)
+    y2_proj = A * x2_proj + B
+    return np.array([[x2_proj, y2_proj], [x1_proj, y1_proj]], dtype=np.float32)
+
+import matplotlib.pyplot as plt
+
+def test_plot_find_parallel():
+    p1 = np.array([1.0, 1.0])
+    p2 = np.array([4.0, 4.0])
+    p3 = np.array([1.0, 4.0])
+
+
+    primes = find_orthogonal_projection(p1, p2, p3)
+    p1_prime = primes[2:4]
+    p2_prime = primes[0:2]
+
+    x_vals = np.array([0, 5])
+    y_vals_line1 = (p2[1] - p1[1]) / (p2[0] - p1[0]) * (x_vals - p1[0]) + p1[1]
+    # y_vals_line2 = A * x_vals + B
+
+    plt.figure()
+    plt.plot(x_vals, y_vals_line1, label='Original Line (p1 to p2)')
+    # plt.plot(x_vals, y_vals_line2, label='Parallel Line through p3', linestyle='--')
+    plt.scatter(*p1, color='red', label='p1')
+    plt.scatter(*p2, color='blue', label='p2')
+    plt.scatter(*p3, color='green', label='p3')
+    plt.scatter(*p1_prime, color='orange', label="Projection of p1")
+    plt.scatter(*p2_prime, color='purple', label="Projection of p2")
+    plt.legend()
+    plt.xlabel('X-axis')
+    plt.ylabel('Y-axis')
+    plt.title('Parallel Line Test')
+    plt.grid()
+    plt.axis('equal')
+    plt.show()
+
+if __name__ == "__main__":
+    test_plot_find_parallel()

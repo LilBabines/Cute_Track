@@ -7,8 +7,10 @@ import numpy as np
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 # ------ Local imports from utils.py ------
-from .utils import PolyClass,OBBOX, cvimg_to_qimage, draw_annotations
-from .qt_workers import DetectionWorker, MODEL_PATH
+from .utils import PolyClass,OBBOX, cvimg_to_qimage, draw_annotations, find_orthogonal_projection
+from .qt_workers import DetectionWorker, MODEL_PATH, FinetuneWorker
+
+from ultralytics import YOLO
 
 
 class BaseVideoPlayer(QtWidgets.QMainWindow):
@@ -72,7 +74,7 @@ class BaseVideoPlayer(QtWidgets.QMainWindow):
 
 
         # --- new action buttons with tooltips showing shortcuts ---
-        self.add_btn = QtWidgets.QPushButton("Add Box (N)")
+        self.add_btn = QtWidgets.QPushButton("Add (N)")
         self.add_btn.setToolTip("Start add-box mode.\nClick 4 points to make an oriented box.\nShortcut: N")
         self.add_btn.clicked.connect(self.start_add_mode)
 
@@ -105,6 +107,7 @@ class BaseVideoPlayer(QtWidgets.QMainWindow):
         self.prev_btn = QtWidgets.QPushButton("⟸ Prev (←)")
         self.next_btn = QtWidgets.QPushButton("Next (→) ⟹")
         self.run_btn = QtWidgets.QPushButton("Run Model")
+        self.finetune_btn = QtWidgets.QPushButton("Finetune Model")
         self.play_btn = QtWidgets.QPushButton("Play ▶")
         self.pause_btn = QtWidgets.QPushButton("Pause ⏸")
         self.save_btn = QtWidgets.QPushButton("Save dataset (JSON)")
@@ -124,38 +127,37 @@ class BaseVideoPlayer(QtWidgets.QMainWindow):
         )
         self.info_label.setStyleSheet("color:#aaa;")
 
-        ctrl_row = QtWidgets.QHBoxLayout()
-        ctrl_row.addWidget(self.open_btn)
-        ctrl_row.addSpacing(10)
-        ctrl_row.addWidget(self.prev_btn)
-        ctrl_row.addWidget(self.next_btn)
-        ctrl_row.addSpacing(10)
-        ctrl_row.addWidget(self.play_btn)
-        ctrl_row.addWidget(self.pause_btn)
-        ctrl_row.addSpacing(20)
-        ctrl_row.addWidget(self.run_btn)
-        ctrl_row.addWidget(self.inference_conf_tresh)
-        ctrl_row.addStretch(1)
-        ctrl_row.insertWidget(6, self.add_btn)
-        ctrl_row.insertWidget(7, self.edit_btn)
-        ctrl_row.insertWidget(8, self.verify_btn)
-        ctrl_row.insertWidget(9, self.delete_btn)
-        ctrl_row.insertWidget(0, self.zoom_in_btn)
-        ctrl_row.insertWidget(1, self.zoom_out_btn)
-        ctrl_row.insertWidget(2, self.zoom_fit_btn)
-        ctrl_row.addWidget(self.save_btn)
+        # 1) Left side: video + slider stacked vertically
+        left_stack = QtWidgets.QWidget()
+        left_v = QtWidgets.QVBoxLayout(left_stack)
+        left_v.setContentsMargins(0, 0, 0, 0)
+        left_v.setSpacing(6)
+        left_v.addWidget(self.video_label, stretch=1)
+        left_v.addWidget(self.frame_slider)
 
-        layout = QtWidgets.QVBoxLayout(central)
-        layout.addWidget(self.video_label, stretch=1)
-        layout.addWidget(self.frame_slider)
-        layout.addLayout(ctrl_row)
-        layout.addWidget(self.info_label)
+        # 2) Main content row: left stack + right column
+        content_row = QtWidgets.QHBoxLayout()
+        content_row.setContentsMargins(0, 0, 0, 0)
+        content_row.setSpacing(10)
+        content_row.addWidget(left_stack, stretch=1)
+        content_row.addWidget(self._build_side_panel(), stretch=0)
+
+        self._build_menu_bar()
+
+        # 3) Overall page: content row, bottom transport bar (centered), info label
+        page = QtWidgets.QVBoxLayout(self.centralWidget())
+        page.setContentsMargins(8, 8, 8, 8)
+        page.setSpacing(8)
+        page.addLayout(content_row, stretch=1)
+        page.addWidget(self._build_transport_bar())
+        page.addWidget(self.info_label)
 
         # Signals
         self.open_btn.clicked.connect(self.open_video)
         self.prev_btn.clicked.connect(self.prev_frame)
         self.next_btn.clicked.connect(self.next_frame)
         self.run_btn.clicked.connect(self.run_model_cached)
+        self.finetune_btn.clicked.connect(self.finetune_model)
         self.play_btn.clicked.connect(self.play)
         self.pause_btn.clicked.connect(self.pause)
         self.save_btn.clicked.connect(self.save_dataset_json)
@@ -177,6 +179,118 @@ class BaseVideoPlayer(QtWidgets.QMainWindow):
 
         self.model_worker = DetectionWorker
 
+
+    # ---------- Build GUI ----------
+    def _build_transport_bar(self) -> QtWidgets.QWidget:
+        """
+        Bottom-centered toolbar for reading controls: prev/next, play/pause, zoom.
+        """
+        bar = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(bar)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(10)
+
+        # center the controls
+        h.addStretch(1)
+
+        # reading controls
+        h.addWidget(self.prev_btn)
+        h.addWidget(self.play_btn)
+        h.addWidget(self.pause_btn)
+        h.addWidget(self.next_btn)
+
+        # a little gap then zoom controls
+        h.addSpacing(20)
+        h.addWidget(self.zoom_out_btn)
+        h.addWidget(self.zoom_in_btn)
+        h.addWidget(self.zoom_fit_btn)
+
+        h.addStretch(1)
+
+        return bar
+
+    def _build_side_panel(self) -> QtWidgets.QWidget:
+        """
+        Right-side vertical panel for all other actions.
+        """
+        panel = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(panel)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(8)
+
+        # Make the column hug the top
+        v.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+
+        # # Group: File & Save
+        # file_box = QtWidgets.QGroupBox("File")
+        # file_l = QtWidgets.QVBoxLayout(file_box)
+        # file_l.addWidget(self.open_btn)
+        # file_l.addWidget(self.save_btn)
+
+        # Group: Inference
+        infer_box = QtWidgets.QGroupBox("Inference")
+        infer_l = QtWidgets.QVBoxLayout(infer_box)
+        infer_l.addWidget(self.run_btn)
+        infer_l.addWidget(self.inference_conf_tresh)
+        infer_l.addWidget(self.finetune_btn)
+
+        # Group: Annotation
+        anno_box = QtWidgets.QGroupBox("Annotation")
+        anno_l = QtWidgets.QVBoxLayout(anno_box)
+        anno_l.addWidget(self.add_btn)
+        anno_l.addWidget(self.edit_btn)
+        anno_l.addWidget(self.verify_btn)
+        anno_l.addWidget(self.delete_btn)
+
+        # Add groups to the column
+        # v.addWidget(file_box)
+        v.addWidget(infer_box)
+        v.addWidget(anno_box)
+        v.addStretch(1)
+
+        # keep the column narrow
+        panel.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Expanding)
+        return panel
+    
+    def _build_menu_bar(self):
+        """
+        Create a top menu bar with File and Help menus.
+        """
+        menubar = self.menuBar()
+
+        # --- File menu ---
+        file_menu = menubar.addMenu("&File")
+
+        open_act = QtGui.QAction("Open Video...", self)
+        open_act.setShortcut("Ctrl+O")
+        open_act.triggered.connect(self.open_video)
+        file_menu.addAction(open_act)
+
+        save_act = QtGui.QAction("Export Verified (JSON)", self)
+        save_act.setShortcut("Ctrl+S")
+        save_act.triggered.connect(self.save_dataset_json)
+        file_menu.addAction(save_act)
+
+        file_menu.addSeparator()
+
+        exit_act = QtGui.QAction("Exit", self)
+        exit_act.setShortcut("Ctrl+Q")
+        exit_act.triggered.connect(self.close)
+        file_menu.addAction(exit_act)
+
+        # --- Optional Help/About menu ---
+        help_menu = menubar.addMenu("&Help")
+        about_act = QtGui.QAction("About", self)
+        about_act.triggered.connect(self._show_about)
+        help_menu.addAction(about_act)  
+
+    def _show_about(self):
+        QtWidgets.QMessageBox.information(
+            self,
+            "About",
+            "Video Annotation Tool\n© 2025 Your Name / Lab\nBuilt with PyQt6"
+        )
+        
     # ---------- Video I/O ----------
     def open_video(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -361,6 +475,71 @@ class BaseVideoPlayer(QtWidgets.QMainWindow):
         self.worker_thread.finished.connect(self.worker.deleteLater)
         self.worker_thread.finished.connect(self.worker_thread.deleteLater)
         self.worker_thread.start()
+
+    def finetune_model(self):
+
+        if not self.video_path:
+            QtWidgets.QMessageBox.warning(self, "Fine-tune", "Load a video first.")
+            return
+        if not self.dataset:
+            QtWidgets.QMessageBox.warning(self, "Fine-tune", "No verified annotations to train on.")
+            return
+        if not self.class_names:
+            QtWidgets.QMessageBox.warning(self, "Fine-tune", "No class names defined.")
+            return
+
+        # first export validated dataset to json
+        self.save_dataset_json()
+    
+        self.finetune_btn.setEnabled(False)
+        self.finetune_btn.setText("Finetuning...")
+
+            # choose a base OBB model, e.g., 'yolo11n-obb.pt'
+        base_model = MODEL_PATH  # or a file dialog / settings
+
+        self.finetune_thread = QtCore.QThread(self)
+        self.finetune_worker = FinetuneWorker(
+            video_path=self.video_path,
+            dataset=self.dataset,
+            class_names=self.class_names,
+            base_model_path=base_model,
+            out_root=os.path.join(os.getcwd(), "finetune_runs"),
+            epochs=20,
+            imgsz=640,
+            batch=16,
+            val_split=0.1,
+        )
+        self.finetune_worker.moveToThread(self.finetune_thread)
+
+        # connect signals
+        self.finetune_thread.started.connect(self.finetune_worker.run)
+        self.finetune_worker.progress.connect(lambda msg, p: self.info_label.setText(f"{msg} ({int(p*100)}%)"))
+        self.finetune_worker.error.connect(self._on_finetune_error)
+        self.finetune_worker.finished.connect(self._on_finetune_done)
+
+        # cleanup
+        self.finetune_worker.finished.connect(self.finetune_thread.quit)
+        self.finetune_worker.finished.connect(self.finetune_worker.deleteLater)
+        self.finetune_thread.finished.connect(self.finetune_thread.deleteLater)
+        self.finetune_worker.error.connect(self.finetune_thread.quit)
+        self.finetune_worker.error.connect(self.finetune_worker.deleteLater)
+
+        self.finetune_thread.start()
+
+    def _on_finetune_error(self, msg: str):
+        QtWidgets.QMessageBox.critical(self, "Fine-tune Error", msg)
+        self.info_label.setText(f"Error: {msg}")
+
+    def _on_finetune_done(self, best_pt_path: str):
+        self.info_label.setText(f"Fine-tune complete: {best_pt_path}")
+        # Optionally load the new weights right away:
+        try:
+            DetectionWorker._model = YOLO(best_pt_path)
+            self.info_label.setText(f"Loaded fine-tuned model: {os.path.basename(best_pt_path)}")
+        except Exception as e:
+            self.info_label.setText(f"Model saved, but failed to load: {e}")
+        self.finetune_btn.setEnabled(True)
+        self.finetune_btn.setText("Finetune Model")
 
     def _on_inference_done(self, frame_idx: int, class_names, annots: List[PolyClass]):
         self.class_names = class_names
@@ -793,7 +972,23 @@ class BaseVideoPlayer(QtWidgets.QMainWindow):
         super().resizeEvent(event)
         self.redraw_current()
 
+    # ---------- Add-poloy pipeline (n clicks) ----------
+    def add_click_point(self, x: float, y: float):
+        self.temp_poly_pts.append([x, y])
+        first_point = self.temp_poly_pts[0]
 
+        if len(self.temp_poly_pts) > 1 and np.linalg.norm(np.array([x, y]) - np.array(first_point)) < 5.0:
+            # close polygon if near first point
+            self.temp_poly_pts[-1] = first_point
+
+            pts = np.array(self.temp_poly_pts, dtype=np.float32)
+            new_box = PolyClass(poly=pts, cls_id=0, conf=1.0, verified=False)
+            self.pred_cache.setdefault(self.current_idx, []).append(new_box)
+            self.selected_idx = len(self.pred_cache[self.current_idx]) - 1
+            self.temp_poly_pts.clear()
+            self.set_mode("select")
+            self.update_dataset_for_frame(self.current_idx)
+        self.redraw_current()
 
 
 class OBB_VideoPlayer(BaseVideoPlayer):
@@ -802,16 +997,22 @@ class OBB_VideoPlayer(BaseVideoPlayer):
 
     # ---------- Add-box pipeline (4 clicks) ----------
     def add_click_point(self, x: float, y: float):
-        self.temp_poly_pts.append([x, y])
-        if len(self.temp_poly_pts) == 4:
-            # finalize new box
-            pts = np.array(self.temp_poly_pts, dtype=np.float32)
+        
+        if len(self.temp_poly_pts) == 2:
+
+            primes = find_orthogonal_projection(self.temp_poly_pts[0], self.temp_poly_pts[1], [x, y])
+            pts = np.concatenate((self.temp_poly_pts, primes), axis=0, dtype=np.float32)
+            
+            # pts = np.array(self.temp_poly_pts, dtype=np.float32)
             new_box = OBBOX(poly=pts, cls_id=0, conf=1.0, verified=False)
             self.pred_cache.setdefault(self.current_idx, []).append(new_box)
             self.selected_idx = len(self.pred_cache[self.current_idx]) - 1
             self.temp_poly_pts.clear()
             self.set_mode("select")
             self.update_dataset_for_frame(self.current_idx)
+        else : 
+            self.temp_poly_pts.append([x, y])
+
         self.redraw_current()
 
     
