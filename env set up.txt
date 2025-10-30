@@ -1,0 +1,4 @@
+-------- PYTHON VERSION : 3.13 ------------------
+
+1.    pip install  ultralytics
+
