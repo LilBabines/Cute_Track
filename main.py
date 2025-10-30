@@ -5,7 +5,7 @@ from src.qt_windows import OBB_VideoPlayer,BaseVideoPlayer
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    w = BaseVideoPlayer()
+    w = Base()
     w.show()
     sys.exit(app.exec())
 

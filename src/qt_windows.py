@@ -1,19 +1,95 @@
 
 import os
 from typing import Optional, List, Dict, Any
-
+from pathlib import Path
 import cv2
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 # ------ Local imports from utils.py ------
-from .utils import PolyClass,OBBOX, cvimg_to_qimage, draw_annotations, find_orthogonal_projection
+from .utils import PolyClass,OBBOX, cvimg_to_qimage, draw_annotations, find_orthogonal_projection, ensure_bgr_u8, mask_to_polys,load_mask_png
 from .qt_workers import DetectionWorker, MODEL_PATH, FinetuneWorker
 
 from ultralytics import YOLO
 
 
-class BaseVideoPlayer(QtWidgets.QMainWindow):
+class FrameSource:
+    def count(self) -> int: ...
+    def read(self, idx: int) -> Optional[np.ndarray]: ...
+    def fps(self) -> float: return 25.0
+    def close(self): pass
+    def name(self) -> str: return ""
+
+class VideoSource(FrameSource):
+    def __init__(self, path: str):
+        self.path = path
+        self.cap = cv2.VideoCapture(path)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {path}")
+        self._count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        self._fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 25.0)
+
+    def count(self) -> int:
+        return self._count
+
+    def read(self, idx: int) -> Optional[np.ndarray]:
+        idx = max(0, min(idx, self._count - 1))
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = self.cap.read()
+        if not ok or frame is None:
+            return None
+        return frame
+
+    def fps(self) -> float:
+        return self._fps
+
+    def close(self):
+        if self.cap:
+            self.cap.release()
+
+    def name(self) -> str:
+        return os.path.basename(self.path)
+
+class ImageFolderSource(FrameSource):
+    IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+
+    def __init__(self, folder: str):
+        self.folder = folder
+        files = [f for f in os.listdir(folder)]
+        files = [f for f in files if os.path.splitext(f)[1].lower() in self.IMAGE_EXTS]
+        if not files:
+            raise RuntimeError("No images found in folder.")
+        # tri naturel simple (numérique si possible)
+        def _key(s):
+            import re
+            return [int(t) if t.isdigit() else t.lower() for t in re.findall(r'\d+|\D+', s)]
+        files.sort(key=_key)
+        self.paths = [os.path.join(folder, f) for f in files]
+
+    def count(self) -> int:
+        return len(self.paths)
+
+    def read(self, idx: int) -> Optional[np.ndarray]:
+        idx = max(0, min(idx, len(self.paths) - 1))
+        p = self.paths[idx]
+        # cv2.imread lit TIFF (première page). Si multi-page, on prend la page 0.
+        img = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return None
+        return ensure_bgr_u8(img)
+
+    def fps(self) -> float:
+        # lecture image par image: fps arbitraire (pour Play)
+        return 10.0
+
+    def name(self) -> str:
+        return os.path.basename(self.folder)
+    
+    def path_at(self, idx: int) -> str:
+        idx = max(0, min(idx, len(self.paths) - 1))
+        return self.paths[idx]
+
+class Base(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
 
@@ -22,11 +98,12 @@ class BaseVideoPlayer(QtWidgets.QMainWindow):
         self.resize(1200, 760)
 
         # Video state
-        self.cap: Optional[cv2.VideoCapture] = None
+        # self.cap: Optional[cv2.VideoCapture] = None
+        self.source: Optional[FrameSource] = None
         self.total_frames: int = 0
         self.current_idx: int = 0
         self.current_frame_bgr: Optional[np.ndarray] = None
-        self.video_path: Optional[str] = None
+        # self.video_path: Optional[str] = None
         self.play_timer = QtCore.QTimer(self)
         self.play_timer.timeout.connect(self._on_play_tick)
         self.playing = False
@@ -36,6 +113,7 @@ class BaseVideoPlayer(QtWidgets.QMainWindow):
         self.min_zoom = 0.25
         self.max_zoom = 8.0
         self.pan_img = np.array([0.0, 0.0], dtype=np.float32)   # pan in *image* pixels
+
 
         # Annotations state
         self.pred_cache: Dict[int, List[PolyClass]] = {}   # frame_idx -> boxes
@@ -103,7 +181,8 @@ class BaseVideoPlayer(QtWidgets.QMainWindow):
         self.zoom_out_btn.clicked.connect(lambda: self.zoom_step(-1))
         self.zoom_fit_btn.clicked.connect(self.zoom_fit)
 
-        self.open_btn = QtWidgets.QPushButton("Open video")
+        self.open_video_btn = QtWidgets.QPushButton("Open video")
+        self.open_images_btn = QtWidgets.QPushButton("Open image folder")
         self.prev_btn = QtWidgets.QPushButton("⟸ Prev (←)")
         self.next_btn = QtWidgets.QPushButton("Next (→) ⟹")
         self.run_btn = QtWidgets.QPushButton("Run Model")
@@ -153,7 +232,8 @@ class BaseVideoPlayer(QtWidgets.QMainWindow):
         page.addWidget(self.info_label)
 
         # Signals
-        self.open_btn.clicked.connect(self.open_video)
+        self.open_video_btn.clicked.connect(self.open_video)
+        self.open_images_btn.clicked.connect(self.open_folder)
         self.prev_btn.clicked.connect(self.prev_frame)
         self.next_btn.clicked.connect(self.next_frame)
         self.run_btn.clicked.connect(self.run_model_cached)
@@ -221,12 +301,6 @@ class BaseVideoPlayer(QtWidgets.QMainWindow):
         # Make the column hug the top
         v.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
 
-        # # Group: File & Save
-        # file_box = QtWidgets.QGroupBox("File")
-        # file_l = QtWidgets.QVBoxLayout(file_box)
-        # file_l.addWidget(self.open_btn)
-        # file_l.addWidget(self.save_btn)
-
         # Group: Inference
         infer_box = QtWidgets.QGroupBox("Inference")
         infer_l = QtWidgets.QVBoxLayout(infer_box)
@@ -261,10 +335,23 @@ class BaseVideoPlayer(QtWidgets.QMainWindow):
         # --- File menu ---
         file_menu = menubar.addMenu("&File")
 
-        open_act = QtGui.QAction("Open Video...", self)
-        open_act.setShortcut("Ctrl+O")
-        open_act.triggered.connect(self.open_video)
-        file_menu.addAction(open_act)
+        open_video_act = QtGui.QAction("Open Video...", self)
+        open_video_act.setShortcut("Ctrl+O")
+        open_video_act.triggered.connect(self.open_video)
+
+        open_images_act = QtGui.QAction("Open Image Folder...", self)
+        open_images_act.setShortcut("Ctrl+I")
+        open_images_act.triggered.connect(self.open_folder)
+
+        open_menu = QtWidgets.QMenu("Open", self)
+        open_menu.addAction(open_video_act)
+        open_menu.addAction(open_images_act)
+        file_menu.addMenu(open_menu)
+
+        load_masks_act = QtGui.QAction("Load Mask Folder...", self)
+        load_masks_act.setShortcut("Ctrl+M")
+        load_masks_act.triggered.connect(self.load_masks_folder)
+        file_menu.addAction(load_masks_act)
 
         save_act = QtGui.QAction("Export Verified (JSON)", self)
         save_act.setShortcut("Ctrl+S")
@@ -300,37 +387,117 @@ class BaseVideoPlayer(QtWidgets.QMainWindow):
             return
         self.load_video(path)
 
-    def load_video(self, path: str):
-        if self.cap:
-            self.cap.release()
-            self.cap = None
-
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            self.info("Failed to open video.")
+    def open_folder(self):
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Open Image Folder", "")
+        if not folder:
             return
+        self.load_folder(folder)
 
-        self.cap = cap
-        self.video_path = path
-        self.total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 0
-        self.current_idx = 0
+    def _set_source(self, src: FrameSource):
+        # ferme l’ancienne source
+        if self.source:
+            try:
+                self.source.close()
+            except Exception:
+                pass
+
         self.pred_cache.clear()
         self.dataset.clear()
         self.selected_idx = None
-
+        self.mode = "select"
+        self.temp_poly_pts.clear()
+        self.source = src
+        self.total_frames = src.count()
+        self.current_idx = 0
         self.frame_slider.setRange(0, max(0, self.total_frames - 1))
         self.frame_slider.setValue(0)
-        self.info(f"Loaded: {os.path.basename(path)} | frames={self.total_frames} | fps={fps:.2f}")
+        self.info(f"Loaded: {src.name()} | frames={self.total_frames} | fps={src.fps():.2f}")
         self.read_frame(self.current_idx)
 
+    def load_video(self, path: str):
+        try:
+            src = VideoSource(path)
+        except Exception as e:
+            self.info(f"Failed to open video: {e}")
+            return
+        self._set_source(src)
+
+    def load_folder(self, folder: str):
+        try:
+            src = ImageFolderSource(folder)
+        except Exception as e:
+            self.info(f"Failed to open folder: {e}")
+            return
+        self._set_source(src)
+    
+    def load_masks_folder(self):
+        """
+        Ouvre un dossier de masques .png, et pré-remplit self.pred_cache:
+        self.pred_cache[frame_idx] = [PolyClass(...), ...] pour chaque image.
+        - On matche par nom de fichier (stem identique, extension .png).
+        - cls_id = 0, conf = 1.0, verified/deleted = False.
+        """
+        # Vérification source
+        if self.source is None or not hasattr(self.source, "path_at"):
+            self.info("Charge d'abord un dossier d'images (pas une vidéo).")
+            return
+
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Mask Folder (PNG)", "")
+        if not folder:
+            return
+
+        # Indexation des .png existants dans le dossier de masques (pour lookup rapide)
+        mask_dir = Path(folder)
+        png_files = {p.stem: str(p) for p in mask_dir.glob("*.png")}
+        if not png_files:
+            self.info("Aucun masque .png trouvé dans ce dossier.")
+            return
+
+        # Reset (on remplit depuis zéro)
+        self.pred_cache.clear()
+        self.selected_idx = None
+
+        # Progression (optionnel mais utile pour gros dossiers)
+        prog = QtWidgets.QProgressDialog("Importing masks…", "Cancel", 0, self.total_frames, self)
+        prog.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(400)
+
+        imported = 0
+        for i in range(self.total_frames):
+            if prog.wasCanceled():
+                break
+            prog.setValue(i)
+
+            img_path = Path(self.source.path_at(i))
+            stem = img_path.stem
+            mask_path = png_files.get(stem)
+            if not mask_path:
+                # pas de masque pour cette frame → liste vide
+                self.pred_cache[i] = []
+                continue
+
+            # Lecture du masque (8/16 bits OK)
+            mask = load_mask_png(mask_path)
+            if mask is None:
+                self.pred_cache[i] = []
+                continue
+
+            # Conversion en polygones
+            polys_np = mask_to_polys(mask)  # List[np.ndarray (n,2)]
+            poly_objs = [PolyClass(poly=p.astype(np.float32), cls_id=0, conf=1.0) for p in polys_np]
+            self.pred_cache[i] = poly_objs
+            imported += len(poly_objs)
+
+        prog.setValue(self.total_frames)
+        self.info(f"Masques chargés: {imported} polygones sur {self.total_frames} images.")
+        self.redraw_current()
+            
     def read_frame(self, idx: int) -> bool:
-        if not self.cap:
+        if not self.source:
             return False
         idx = max(0, min(idx, self.total_frames - 1))
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ok, frame = self.cap.read()
-        if not ok or frame is None:
+        frame = self.source.read(idx)
+        if frame is None:
             self.info("Failed to read frame.")
             return False
         self.current_idx = idx
@@ -339,8 +506,8 @@ class BaseVideoPlayer(QtWidgets.QMainWindow):
         self.frame_slider.setValue(idx)
         self.frame_slider.blockSignals(False)
         self.update_title()
-
         self.redraw_current()
+        # self.frame_changed.emit(idx)
         return True
 
     # ---------- Display & mapping ----------
@@ -403,29 +570,28 @@ class BaseVideoPlayer(QtWidgets.QMainWindow):
 
     # ---------- Controls ----------
     def prev_frame(self):
-        if self.cap:
-            self.pause()
-            self.selected_idx = None
-            self.read_frame(self.current_idx - 1)
+        if not self.source:
+            return
+        self.pause()
+        self.read_frame(self.current_idx - 1)
 
     def next_frame(self):
-        if self.cap:
-            self.pause()
-            self.selected_idx = None
-            self.read_frame(self.current_idx + 1)
+        if not self.source:
+            return
+        self.pause()
+        self.read_frame(self.current_idx + 1)
 
     def _on_slider_released(self):
-        if self.cap:
-            self.pause()
-            self.selected_idx = None
-            self.read_frame(self.frame_slider.value())
+        if not self.source:
+            return
+        self.pause()
+        self.read_frame(self.frame_slider.value())
 
     def play(self):
-        if not self.cap or self.playing:
+        if not self.source or self.playing:
             return
-        fps = self.cap.get(cv2.CAP_PROP_FPS) or 25
-        interval_ms = int(1000 / fps)
-        self.play_timer.start(max(15, interval_ms))
+        fps = self.source.fps() or 25
+        self.play_timer.start(max(15, int(1000 / fps)))
         self.playing = True
         self.update_title()
 
@@ -445,7 +611,6 @@ class BaseVideoPlayer(QtWidgets.QMainWindow):
         if self.current_idx + 1 >= self.total_frames:
             self.pause()
             return
-        self.selected_idx = None
         self.read_frame(self.current_idx + 1)
 
     # ---------- Inference with cache ----------
@@ -961,10 +1126,10 @@ class BaseVideoPlayer(QtWidgets.QMainWindow):
         self.info_label.setText(text)
 
     def update_title(self):
-        base = self.baseTitle
-        if self.video_path:
-            base += f" | {os.path.basename(self.video_path)}"
-        if self.cap:
+        base = "Base Video Player"
+        if self.source:
+            base += f" | {self.source.name()}"
+        if self.source:
             base += f" | frame {self.current_idx+1}/{self.total_frames}"
         self.setWindowTitle(base)
 
@@ -991,7 +1156,7 @@ class BaseVideoPlayer(QtWidgets.QMainWindow):
         self.redraw_current()
 
 
-class OBB_VideoPlayer(BaseVideoPlayer):
+class OBB_VideoPlayer(Base):
     def __init__(self):
         super().__init__()
 
@@ -1014,5 +1179,6 @@ class OBB_VideoPlayer(BaseVideoPlayer):
             self.temp_poly_pts.append([x, y])
 
         self.redraw_current()
+
 
     

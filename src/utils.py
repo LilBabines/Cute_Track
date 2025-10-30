@@ -5,6 +5,36 @@ import cv2
 import numpy as np
 from PySide6 import QtGui
 
+import warnings
+
+
+def ensure_bgr_u8(img: np.ndarray) -> np.ndarray:
+    """Convertit une image (8/16 bits, mono/RGBA) en BGR uint8 pour affichage + traitement.
+       - 16 bits -> mise à l'échelle 0..255 (normalisation)
+       - 1 canal -> BGR
+       - 4 canaux (BGRA) -> BGR
+    """
+    if img is None:
+        return img
+    # 16-bit -> 8-bit
+    if img.dtype == np.uint16:
+        # normalise plein-écart pour l'affichage fiable
+        i_min, i_max = int(img.min()), int(img.max())
+        if i_max > i_min:
+            img8 = ((img - i_min) * 255.0 / (i_max - i_min)).astype(np.uint8)
+        else:
+            img8 = (img / 256).astype(np.uint8)
+        img = img8
+    elif img.dtype != np.uint8:
+        # fallback simple
+        img = cv2.convertScaleAbs(img)
+
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    elif img.shape[2] == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    return img
+
 def cvimg_to_qimage(img_bgr: np.ndarray) -> QtGui.QImage:
     if img_bgr is None:
         return QtGui.QImage()
@@ -30,7 +60,67 @@ class PolyClass:
             "deleted": bool(self.deleted),
         }
 
+def load_mask_png(path: str) -> np.ndarray:
+    """Charge un masque PNG (RGBA ou grayscale) en ndarray."""
+    mask = cv2.imread(path, cv2.IMREAD_UNCHANGED)
 
+    if mask.ndim == 3 and mask.shape[2] == 4:
+        # RGBA ou BGRA -> alpha
+        m = mask[..., 3].astype(np.uint8)
+    elif  mask.ndim == 2:
+        m = np.where(mask < 50, 255, 0).astype(np.uint8)
+    else:
+        # warning
+        warnings.warn(f"Mask image at {path} has unsupported format with shape {mask.shape}.")
+        m = None
+    
+    return m
+def mask_to_polys(mask: np.ndarray,
+                  *,
+                  min_area_frac: float = 1e-4,
+                  epsilon_frac: float = 0.002) -> List[np.ndarray]:
+    """
+    Convertit un masque binaire (alpha ou grayscale) en polygones.
+    Gère :
+      - PNG RGBA (prend le canal alpha)
+      - Masques noir/blanc (inversion automatique si fond clair)
+    Retour : liste de np.ndarray (N,2) float32.
+    """
+    if mask is None:
+        return []
+    
+    m = mask.copy()
+
+    H, W = m.shape
+    img_area = H * W
+
+    # --- Auto-détection du foreground ---
+    mean_val = np.mean(m)
+    # si fond clair (>127) => les objets sont sombres -> inverser
+    if mean_val > 127:
+        m = cv2.bitwise_not(m)
+
+    # --- Binarisation robuste (Otsu) ---
+    _, bw = cv2.threshold(m, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # --- Contours extérieurs ---
+    contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    polys: List[np.ndarray] = []
+    min_area = max(1.0, min_area_frac * img_area)
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
+        eps = epsilon_frac * cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, eps, True)
+        if approx is None or len(approx) < 3:
+            continue
+        pts = approx.reshape(-1, 2).astype(np.float32)
+        polys.append(pts)
+
+    return polys
 
 @dataclass
 class OBBOX(PolyClass):
