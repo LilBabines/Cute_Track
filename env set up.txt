@@ -1,4 +1,9 @@
 -------- PYTHON VERSION : 3.13 ------------------
 
-1.    pip install  ultralytics
+1.    pip install  ultralytics lightning torchmetrics 
+2.    cd src/
+3.    git clone https://github.com/facebookresearch/sam2.git && cd sam2
+4.    pip install -e .
+5.    cd checkpoints && ./download_ckpts.sh
+6.    pip install -U 'tensorboardX'
 

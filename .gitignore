@@ -223,3 +223,7 @@ __marimo__/
 
 finetune_runs/
 dataset.json
+
+datasets/
+*.ckpt
+*logs/
