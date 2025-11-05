@@ -7,6 +7,7 @@ from torchmetrics.segmentation import DiceScore
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+torch.set_float32_matmul_precision('medium')
 
 cb_checkpoint = ModelCheckpoint(
     monitor="val/dice",
@@ -20,12 +21,13 @@ lit = LitBinarySeg(
     net,
     deep_supervision=True,
     dice_use_all_outputs=False,      # mets True si tu veux la Dice moyenne (out,out1,out2)
-    pos_weight=100                   # utile si classe rare
+    pos_weight=200                   # utile si classe rare
 )
-trainer = Trainer(accelerator="gpu", devices=1, max_epochs=150, logger=TensorBoardLogger("lightning_logs/"), callbacks=[cb_checkpoint])
+trainer = Trainer(accelerator="auto", devices=1, max_epochs=100, logger=TensorBoardLogger("lightning_logs/"), callbacks=[cb_checkpoint])
 data_module = DataModule512Mask(
     dataset_path="datasets/sam-unext_dataset",
-    batch_size=2
+    batch_size=16,
+    num_workers=8,
 )
 
 data_module.setup()
@@ -33,8 +35,8 @@ trainer.fit(lit, datamodule=data_module)
 
 best_model_path = cb_checkpoint.best_model_path
 print(f"Best model path: {best_model_path}")
-module = LitBinarySeg.load_from_checkpoint(best_model_path,net=net).to("cuda")
-module.eval()
+# module = LitBinarySeg.load_from_checkpoint(best_model_path,net=net).to("cuda")
+lit.eval()
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # 2) Récupérer un batch de la val
@@ -51,7 +53,7 @@ mask = mask.to(device, non_blocking=True).float()
 idx = 0
 with torch.no_grad():
     # forward retourne les logits (B,1,H,W) via .forward() de LitBinarySeg
-    logits = module(img)                # (B,1,H,W)
+    logits = lit(img)                # (B,1,H,W)
     probs  = torch.sigmoid(logits)      # proba foreground
     p      = probs[idx:idx+1]           # (1,1,H,W)
     y      = mask[idx:idx+1]            # (1,1,H,W)

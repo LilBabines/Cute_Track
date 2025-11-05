@@ -176,7 +176,7 @@ class SAM2UNet(nn.Module):
         self.encoder = model.image_encoder.trunk
 
         for param in self.encoder.parameters():
-            param.requires_grad = False
+            param.requires_grad = True
         blocks = []
         for block in self.encoder.blocks:
             blocks.append(
@@ -213,69 +213,6 @@ class SAM2UNet(nn.Module):
         out = F.interpolate(self.head(x), scale_factor=4, mode='bilinear')
 
         return out, out1, out2
-
-class SAM2UNet_Lightning(L.LightningModule):
-    def __init__(self, config = "small", sam_checkpoint_path=None) -> None:
-        super(SAM2UNet_Lightning, self).__init__()
-        self.model = SAM2UNet(config=config, sam_checkpoint_path=sam_checkpoint_path)
-        self.dice_metric = DiceScore(num_classes=2, include_background=False)
-        self.bce = nn.BCEWithLogitsLoss()
-
-
-
-    def forward(self, x):
-        return self.model(x)
-    
-    def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-5, weight_decay=1e-4) #, weight_decay=1e-4
-        return optimizer
-
-    def training_step(self, batch, batch_idx, *args, **kwargs):
-        images, masks = batch
-        pred0, pred1, pred2 = self.model(images)
-        loss0 = structure_loss(pred0, masks)
-        loss1 = structure_loss(pred1, masks)
-        loss2 = structure_loss(pred2, masks)
-        print("GT",masks.max(), masks.min())
-        # loss0 = self.bce(pred0, masks)
-        # loss1 = self.bce(pred1, masks)
-        # loss2 = self.bce(pred2, masks)
-        loss = loss0 + loss1 + loss2
-        self.log('train_loss', loss)
-
-        return loss
-    
-    def validation_step(self, batch, batch_idx, *args, **kwargs):
-
-        images, masks = batch
-        pred0, pred1, pred2 = self.model(images)
-        
-        loss0 = structure_loss(pred0, masks)
-        loss1 = structure_loss(pred1, masks)
-        loss2 = structure_loss(pred2, masks)
-        # loss0 = self.bce(pred0, masks)
-        # loss1 = self.bce(pred1, masks)
-        # loss2 = self.bce(pred2, masks)
-        loss = loss0 + loss1 + loss2
-        self.log('val_loss', loss)
-        print("pred before sig",pred0.max(), pred0.min())
-        pred = torch.sigmoid(pred0)
-        print("pred after sig",pred.max(), pred.min())
-        res = (pred - pred.min()) / (pred.max() - pred.min() + 1e-8)
-        print("res after norm",res.max(), res.min())
-        mask_pred =  (res >0.5)
-
-        print(mask_pred.unique(return_counts=True))
-        
-        print(masks.unique(return_counts=True))
-
-        dice_score = self.dice_metric(mask_pred, masks)
-        miou_score = self.miou_metric(mask_pred, masks)
-
-
-        self.log('val_dice', dice_score, prog_bar=True)
-        self.log('val_miou', miou_score, prog_bar=True)
-
 
 def _to_onehot2_from_logits(logits, target_01):
     """logits: (B,1,H,W) ; target_01: (B,1,H,W) in {0,1}
@@ -389,12 +326,12 @@ class LitBinarySeg(L.LightningModule):
 
     # -------- steps
     def _step(self, batch, stage: str):
-        x, y = (batch["image"], batch["mask"]) if isinstance(batch, dict) else batch  # y: (B,1,H,W) in {0,1}
+        x, y = (batch["image"], batch["mask"]) if isinstance(batch, dict) else batch[0:2]  # y: (B,1,H,W) in {0,1} , add idx in get_item be careful
         preds = self.net(x)  # (out, out1, out2) logits
 
         loss, losses_dict = self._compute_losses(preds, y)
         self._update_dice_epoch_metric(stage, preds[0], y)
-        self._log_step_dice_mean_if_needed(stage, preds, y)
+        # self._log_step_dice_mean_if_needed(stage, preds, y)
 
         # logs des pertes
         for k, v in losses_dict.items():

@@ -225,5 +225,6 @@ finetune_runs/
 dataset.json
 
 datasets/
+checkpoints/
 *.ckpt
 *logs/

@@ -29,8 +29,12 @@ class DataSet512Mask(Dataset):
         normalize = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         self.transform_image = Compose([self.transform, normalize])
         self.transform_mask = Compose([self.transform, lambda_transform])
-        self.images = [self.transform_image(Image.open(f)) for f in sorted(glob.glob(os.path.join(images_path, "*.tiff")))]
-        self.masks = [self.transform_mask(Image.open(f).convert('L')) for f in sorted(glob.glob(os.path.join(masks_path, "*.png")))]
+        self.images = [self.transform_image(Image.open(f)) for f in sorted(glob.glob(os.path.join(images_path, "*.tiff")))]* 200
+        self.masks = [self.transform_mask(Image.open(f).convert('L')) for f in sorted(glob.glob(os.path.join(masks_path, "*.png")))]*200
+
+        self.augment_2 = Compose([RandomHorizontalFlip(p=1.0)])
+        self.augment_3 = Compose([RandomVerticalFlip(p=1.0)])
+        self.augment_1 = Compose([RandomHorizontalFlip(p=1.0), RandomVerticalFlip(p=1.0)])
 
     def __len__(self):
         return len(self.images)
@@ -38,14 +42,14 @@ class DataSet512Mask(Dataset):
     def __getitem__(self, idx):
         image = self.images[idx]
         mask = self.masks[idx]
-        # P= torch.rand(1)
-        # if P < 0.33:
-        #     image, mask = self.augment_2(image), self.augment_2(mask)
-        # elif P < 0.66:
-        #     image, mask = self.augment_3(image), self.augment_3(mask)
-        # else :
-        #     image, mask = self.augment_1(image), self.augment_1(mask)
-        return image, mask
+        P= torch.rand(1)
+        if P < 0.33:
+            image, mask = self.augment_2(image), self.augment_2(mask)
+        elif P < 0.66:
+            image, mask = self.augment_3(image), self.augment_3(mask)
+        else :
+            image, mask = self.augment_1(image), self.augment_1(mask)
+        return {"image":image, "mask":mask, "idx":idx}
     
     def plot(self,idx):
         import matplotlib.pyplot as plt
@@ -64,10 +68,11 @@ class DataSet512Mask(Dataset):
 
 class DataModule512Mask(L.LightningDataModule):
 
-    def __init__(self, dataset_path, batch_size=8):
+    def __init__(self, dataset_path, batch_size=8, num_workers=4):
         super().__init__()
         self.dataset_path = dataset_path
-        self.batch_size = batch_size    
+        self.batch_size = batch_size
+        self.num_workers = num_workers
 
     def setup(self, stage=None):
         self.train_dataset = DataSet512Mask(
@@ -84,10 +89,10 @@ class DataModule512Mask(L.LightningDataModule):
         print(f"Val dataset size: {len(self.val_dataset)}")
 
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True)
+        return DataLoader(self.train_dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=True)
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size)
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, num_workers=self.num_workers)
 
 
 
