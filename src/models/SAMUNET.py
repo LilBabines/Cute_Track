@@ -19,7 +19,6 @@ from torchvision.transforms import ToTensor, RandomVerticalFlip, RandomHorizonta
 from torch.utils.data import DataLoader, Dataset
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch import Trainer
-from lightning.pytorch.callbacks import ModelCheckpoint
 import numpy as np
 from torchmetrics.segmentation import DiceScore
 
@@ -227,9 +226,9 @@ class LitBinarySeg(L.LightningModule):
     def __init__(
         self,
         net: nn.Module,
-        lr: float = 1e-4,
+        lr: float = 1e-5,
         weight_decay: float = 1e-4,
-        deep_supervision: bool = True,
+        deep_supervision: bool = False,
         aux_weights: tuple[float, float] = (0.3, 0.3),  # (out1, out2) dans la loss
         pos_weight: float | None = 800,                # pour BCEWLL si classe rare
         use_scheduler: bool = True,
@@ -243,10 +242,10 @@ class LitBinarySeg(L.LightningModule):
         # --- loss ---
         if pos_weight is not None:
             self.register_buffer("pos_w_buf", torch.tensor([pos_weight]), persistent=False)
-            self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=self.pos_w_buf)
+            self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=self.pos_w_buf, reduction="none")
         else:
             self.pos_w_buf = None
-            self.bce_loss = nn.BCEWithLogitsLoss()
+            self.bce_loss = nn.BCEWithLogitsLoss(reduction="none")
 
         # --- metrics (état par split) ---
         # binaire => 2 classes, on ignore le background pour le score
@@ -260,15 +259,21 @@ class LitBinarySeg(L.LightningModule):
         probs = torch.sigmoid(logits)
         inter = (probs * target).sum(dim=(2, 3))
         den = probs.sum(dim=(2, 3)) + target.sum(dim=(2, 3)) + eps
-        dice = (2 * inter / den).mean()
+        dice = (2 * inter / den)
         return 1 - dice  # minimiser (1 - dice)
     
     def _compute_losses(self, preds_tuple, target):
         out, out1, out2 = preds_tuple
 
-        bce_main = self.bce_loss(out, target)
-        dice_main = self._dice_loss(out, target)
+        bce_main_no_mean = self.bce_loss(out, target).mean(dim=(2,3))
+
+        bce_main = bce_main_no_mean.mean()
+        
+        dice_main_no_mean = self._dice_loss(out, target)
+
+        dice_main = dice_main_no_mean.mean()
         loss_main = bce_main + self.hparams.dice_weight * dice_main
+        loss_main_no_mean = bce_main_no_mean + self.hparams.dice_weight * dice_main_no_mean
 
         losses = {"loss/main": loss_main, "loss/bce": bce_main, "loss/dice": dice_main}
 
@@ -286,11 +291,12 @@ class LitBinarySeg(L.LightningModule):
             losses["loss/aux1"] = loss1
             losses["loss/aux2"] = loss2
             loss_total = loss_main + w1 * loss1 + w2 * loss2
+
         else:
             loss_total = loss_main
 
         losses["loss/total"] = loss_total
-        return loss_total, losses
+        return loss_total, losses, loss_main_no_mean
 
     def _update_dice_epoch_metric(self, stage: str, out_logits, target):
         """met à jour la metric d'époque avec la sortie principale uniquement"""
@@ -329,14 +335,14 @@ class LitBinarySeg(L.LightningModule):
         x, y = (batch["image"], batch["mask"]) if isinstance(batch, dict) else batch[0:2]  # y: (B,1,H,W) in {0,1} , add idx in get_item be careful
         preds = self.net(x)  # (out, out1, out2) logits
 
-        loss, losses_dict = self._compute_losses(preds, y)
+        loss, losses_dict, losses_not_mean = self._compute_losses(preds, y)
         self._update_dice_epoch_metric(stage, preds[0], y)
         # self._log_step_dice_mean_if_needed(stage, preds, y)
 
         # logs des pertes
         for k, v in losses_dict.items():
-            self.log(f"{stage}/{k}", v, prog_bar=(k == "loss/total"), on_step=True, on_epoch=False)
-        return loss
+            self.log(f"{stage}/{k}", v, prog_bar=(k == "loss/total"), on_step=(stage=="train"), on_epoch=True)
+        return {"loss": loss, "all_losses": losses_not_mean}
 
     def training_step(self, batch, batch_idx):
         return self._step(batch, "train")

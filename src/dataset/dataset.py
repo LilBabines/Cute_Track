@@ -22,15 +22,17 @@ import numpy as np
 class DataSet512Mask(Dataset):
 
 
-    def __init__(self, images_path, masks_path, transform=None):
+    def __init__(self, images_paths, masks_paths, transform=None):
 
         self.transform = ToTensor()
         lambda_transform = lambda x: ((x-1)*-1).abs()
         normalize = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         self.transform_image = Compose([self.transform, normalize])
         self.transform_mask = Compose([self.transform, lambda_transform])
-        self.images = [self.transform_image(Image.open(f)) for f in sorted(glob.glob(os.path.join(images_path, "*.tiff")))]* 200
-        self.masks = [self.transform_mask(Image.open(f).convert('L')) for f in sorted(glob.glob(os.path.join(masks_path, "*.png")))]*200
+        self.images = sorted(images_paths)
+        self.masks = sorted(masks_paths)
+
+       
 
         self.augment_2 = Compose([RandomHorizontalFlip(p=1.0)])
         self.augment_3 = Compose([RandomVerticalFlip(p=1.0)])
@@ -40,8 +42,9 @@ class DataSet512Mask(Dataset):
         return len(self.images)
 
     def __getitem__(self, idx):
-        image = self.images[idx]
-        mask = self.masks[idx]
+        
+        image = self.transform_image(Image.open(self.images[idx]).convert("RGB"))
+        mask = self.transform_mask(Image.open(self.masks[idx]).convert("L"))
         P= torch.rand(1)
         if P < 0.33:
             image, mask = self.augment_2(image), self.augment_2(mask)
@@ -75,14 +78,38 @@ class DataModule512Mask(L.LightningDataModule):
         self.num_workers = num_workers
 
     def setup(self, stage=None):
+
+        images_files = np.array(sorted(glob.glob(os.path.join(self.dataset_path, "images", "*.tiff"))))
+        masks_files = np.array(sorted(glob.glob(os.path.join(self.dataset_path, "GT_Object", "*.png"))))
+
+        np.random.seed(42)
+        train_idx = np.random.choice(len(images_files), int(0.8*len(images_files)), replace=False)
+        val_idx = np.array([i for i in range(len(images_files)) if i not in train_idx])
+
+        train_idx_2_pourcent = np.random.choice(train_idx, max(10, int(0.000005*len(train_idx))), replace=False)
+        train_idx = train_idx_2_pourcent
+
+        val_idx_2_pourcent = np.random.choice(val_idx, max(12, int(0.000005*len(val_idx))), replace=False)
+        val_idx = val_idx_2_pourcent
+
+        train_images = images_files[train_idx]
+        train_masks = masks_files[train_idx]
+        val_images = images_files[val_idx]
+        val_masks = masks_files[val_idx]
+
+
+        for img_path in train_images:
+            print(f"Loaded image-mask pair: {os.path.basename(img_path).split('.')[0]}")
+
         self.train_dataset = DataSet512Mask(
-            images_path=os.path.join(self.dataset_path, "train", "images"),
-            masks_path=os.path.join(self.dataset_path, "train", "GT_object")
+            images_paths=train_images,
+            masks_paths=train_masks
         )
         self.val_dataset = DataSet512Mask(
-            images_path=os.path.join(self.dataset_path, "val", "images"),
-            masks_path=os.path.join(self.dataset_path, "val", "GT_object")
-        )   
+            images_paths=val_images,
+            masks_paths=val_masks
+        )
+        
 
         print(f"Train dataset size: {len(self.train_dataset)}")
 
