@@ -31,6 +31,7 @@ class DataSet512Mask(Dataset):
         self.transform_mask = Compose([self.transform, lambda_transform])
         self.images = sorted(images_paths)
         self.masks = sorted(masks_paths)
+        self.img_names = [os.path.basename(p).split(".")[0] for p in self.images]
 
        
 
@@ -52,7 +53,7 @@ class DataSet512Mask(Dataset):
             image, mask = self.augment_3(image), self.augment_3(mask)
         else :
             image, mask = self.augment_1(image), self.augment_1(mask)
-        return {"image":image, "mask":mask, "idx":idx}
+        return {"image":image, "mask":mask, "idx":idx, "img_name":self.img_names[idx]}
     
     def plot(self,idx):
         import matplotlib.pyplot as plt
@@ -86,20 +87,16 @@ class DataModule512Mask(L.LightningDataModule):
         train_idx = np.random.choice(len(images_files), int(0.8*len(images_files)), replace=False)
         val_idx = np.array([i for i in range(len(images_files)) if i not in train_idx])
 
-        train_idx_2_pourcent = np.random.choice(train_idx, max(10, int(0.000005*len(train_idx))), replace=False)
-        train_idx = train_idx_2_pourcent
+        # train_idx_2_pourcent = np.random.choice(train_idx, max(10, int(0.000005*len(train_idx))), replace=False)
+        # train_idx = train_idx_2_pourcent
 
-        val_idx_2_pourcent = np.random.choice(val_idx, max(12, int(0.000005*len(val_idx))), replace=False)
-        val_idx = val_idx_2_pourcent
+        # val_idx_2_pourcent = np.random.choice(val_idx, max(12, int(0.000005*len(val_idx))), replace=False)
+        # val_idx = val_idx_2_pourcent
 
         train_images = images_files[train_idx]
         train_masks = masks_files[train_idx]
         val_images = images_files[val_idx]
         val_masks = masks_files[val_idx]
-
-
-        for img_path in train_images:
-            print(f"Loaded image-mask pair: {os.path.basename(img_path).split('.')[0]}")
 
         self.train_dataset = DataSet512Mask(
             images_paths=train_images,

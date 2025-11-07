@@ -9,15 +9,16 @@ from torchmetrics.segmentation import DiceScore
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+
 torch.set_float32_matmul_precision('medium')
 
 cb_checkpoint = ModelCheckpoint(
     monitor="val/dice",
-    dirpath="checkpoints/",
+    dirpath="logs/full_train_test_D/",
     save_top_k=1,
     mode="max",
 )
-record_D = Record_train_dynamics()
+record_D = Record_train_dynamics(save_dir="logs/", name="full_train_test_D")
 
 net = SAM2UNet(config="small", sam_checkpoint_path="src/sam2/checkpoints/sam2.1_hiera_small.pt").to("cuda")
 lit = LitBinarySeg(
@@ -26,10 +27,10 @@ lit = LitBinarySeg(
     dice_use_all_outputs=False,      # mets True si tu veux la Dice moyenne (out,out1,out2)
     pos_weight=200                   # utile si classe rare
 )
-trainer = Trainer(accelerator="auto", devices=1, max_epochs=20, logger=TensorBoardLogger("lightning_logs/"), callbacks=[cb_checkpoint, record_D])
+trainer = Trainer(accelerator="auto", devices=1, max_epochs=3, logger=TensorBoardLogger(save_dir="logs/", name="full_train_test_D", version= "tensorboard"), callbacks=[cb_checkpoint, record_D])
 data_module = DataModule512Mask(
     dataset_path="datasets/Train_005",
-    batch_size=4,
+    batch_size=16,
     num_workers=8,
 )
 
@@ -37,6 +38,7 @@ trainer.fit(lit, datamodule=data_module)
 
 best_model_path = cb_checkpoint.best_model_path
 print(f"Best model path: {best_model_path}")
+
 # module = LitBinarySeg.load_from_checkpoint(best_model_path,net=net).to("cuda")
 # lit.eval()
 # device = "cuda" if torch.cuda.is_available() else "cpu"
