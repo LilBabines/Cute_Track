@@ -159,7 +159,12 @@ class SAM2UNet(nn.Module):
     def __init__(self, config= "small", sam_checkpoint_path=None) -> None:
         super(SAM2UNet, self).__init__()    
         self.size = config
-        sam_config = f"sam2_hiera_{config[0]}.yaml"
+        if config in ["small", "tiny", "large"]:
+            sam_config = f"sam2_hiera_{config[0]}.yaml"
+        elif config == "base":
+            sam_config = "sam2_hiera_b+.yaml"
+        else:
+            raise ValueError(f"Unknown config {config}", "expected small, tiny, base, large")
         if sam_checkpoint_path:
             model = build_sam2(sam_config, sam_checkpoint_path)
         else:
@@ -175,7 +180,7 @@ class SAM2UNet(nn.Module):
         self.encoder = model.image_encoder.trunk
 
         for param in self.encoder.parameters():
-            param.requires_grad = True
+            param.requires_grad = False
         blocks = []
         for block in self.encoder.blocks:
             blocks.append(
@@ -186,6 +191,7 @@ class SAM2UNet(nn.Module):
         )
         RFB_modified_input_channels = {"small": [96, 192, 384, 768],
                                        "tiny" : [96, 192, 384, 768],
+                                        "base" : [112, 224, 448, 896],
                                        "large" : [144, 288, 576, 1152]}
         
         rfb1_in, rfb2_in, rfb3_in, rfb4_in = RFB_modified_input_channels[config]
