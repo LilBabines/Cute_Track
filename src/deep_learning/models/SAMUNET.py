@@ -156,7 +156,7 @@ class RFB_modified(nn.Module):
 
 
 class SAM2UNet(nn.Module):
-    def __init__(self, config= "small", sam_checkpoint_path=None) -> None:
+    def __init__(self, config= "small", sam_checkpoint_path=None, freeze_encorder = False) -> None:
         super(SAM2UNet, self).__init__()    
         self.size = config
         if config in ["small", "tiny", "large"]:
@@ -180,7 +180,7 @@ class SAM2UNet(nn.Module):
         self.encoder = model.image_encoder.trunk
 
         for param in self.encoder.parameters():
-            param.requires_grad = False
+            param.requires_grad = not freeze_encorder
         blocks = []
         for block in self.encoder.blocks:
             blocks.append(
@@ -347,7 +347,7 @@ class LitBinarySeg(L.LightningModule):
 
         # logs des pertes
         for k, v in losses_dict.items():
-            self.log(f"{stage}/{k}", v, prog_bar=(k == "loss/total"), on_step=(stage=="train"), on_epoch=True)
+            self.log(f"{stage}/{k}", v, prog_bar=(k == "loss/total"), on_step=(stage=="train"), on_epoch=True, batch_size=x.shape[0])
         return {"loss": loss, "all_losses": losses_not_mean}
 
     def training_step(self, batch, batch_idx):

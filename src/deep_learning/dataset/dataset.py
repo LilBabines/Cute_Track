@@ -22,7 +22,7 @@ import numpy as np
 class DataSet512Mask(Dataset):
 
 
-    def __init__(self, images_paths, masks_paths, transform=None):
+    def __init__(self, images_paths, masks_paths, transform=None, keep_pourcent = 1):
 
         self.transform = ToTensor()
         lambda_transform = lambda x: ((x-1)*-1).abs()
@@ -31,6 +31,13 @@ class DataSet512Mask(Dataset):
         self.transform_mask = Compose([self.transform, lambda_transform])
         self.images = sorted(images_paths)
         self.masks = sorted(masks_paths)
+
+        if keep_pourcent < 1:
+            keep_size = int(len(self.images)*keep_pourcent)
+            random_idx = np.random.choice(len(self.images), keep_size, replace=False)
+            self.images = [self.images[i] for i in random_idx]
+            self.masks = [self.masks[i] for i in random_idx]
+        
         self.img_names = [os.path.basename(p).split(".")[0] for p in self.images]
 
        
@@ -65,18 +72,21 @@ class DataSet512Mask(Dataset):
         f,axes = plt.subplots(1, 3)
         axes[0].imshow(img )
         axes[1].imshow(mask , cmap='gray')
-        masked_img = np.where(mask[..., None], img, 0)
-        axes[2].imshow(masked_img )
+        alpha_img = np.zeros(shape=img.shape[0:2] + (4,))
+        alpha_img[...,0:3] = img
+        alpha_img[...,3] = 0.3 + 0.7*mask 
+        axes[2].imshow(alpha_img )
         plt.show()
     
 
 class DataModule512Mask(L.LightningDataModule):
 
-    def __init__(self, dataset_path, batch_size=8, num_workers=4):
+    def __init__(self, dataset_path, batch_size=8, num_workers=4, keep_pourcent=1):
         super().__init__()
         self.dataset_path = dataset_path
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.keep_pourcent = keep_pourcent
 
     def setup(self, stage=None):
 
@@ -100,11 +110,13 @@ class DataModule512Mask(L.LightningDataModule):
 
         self.train_dataset = DataSet512Mask(
             images_paths=train_images,
-            masks_paths=train_masks
+            masks_paths=train_masks,
+            keep_pourcent=self.keep_pourcent
         )
         self.val_dataset = DataSet512Mask(
             images_paths=val_images,
-            masks_paths=val_masks
+            masks_paths=val_masks,
+            keep_pourcent=self.keep_pourcent
         )
         
 

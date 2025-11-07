@@ -15,7 +15,7 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     np.random.seed(42)
 
-    exp_name = "b_plus"
+    exp_name = "tiny_freeze_for_noisy_detect"
 
     #define callbacks
     cb_checkpoint = ModelCheckpoint(
@@ -27,7 +27,7 @@ if __name__ == "__main__":
     record_D = Record_train_dynamics(save_dir="logs/", name=exp_name)
 
     #initialize model, litmodule, trainer, datamodule
-    net = SAM2UNet(config="base", sam_checkpoint_path="src/sam2/checkpoints/sam2.1_hiera_base_plus.pt").to("cuda")
+    net = SAM2UNet(config="tiny", sam_checkpoint_path="src/sam2/checkpoints/sam2.1_hiera_tiny.pt", freeze_encorder = True).to("cuda")
     lit = LitBinarySeg(
         net,
         deep_supervision=False,
@@ -35,14 +35,15 @@ if __name__ == "__main__":
         pos_weight=200                   # utile si classe rare
     )
     trainer = Trainer(accelerator="auto", devices=1, 
-                      max_epochs=10, 
-                      logger=TensorBoardLogger(save_dir="logs/", name=exp_name, version= "tensorboard"), 
+                      max_epochs=100,
+                      logger=TensorBoardLogger(save_dir="logs/", name=exp_name, version="tensorboard"),
                       callbacks=[cb_checkpoint, record_D])
     
     data_module = DataModule512Mask(
         dataset_path="datasets/Train_005",
-        batch_size=16,
-        num_workers=8,
+        batch_size=8,
+        num_workers=4,
+        keep_pourcent=0.025
     )
 
     trainer.fit(lit, datamodule=data_module)
