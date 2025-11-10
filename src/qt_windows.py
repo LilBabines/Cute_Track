@@ -8,9 +8,11 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 # ------ Local imports from utils.py ------
 from .utils import PolyClass,OBBOX, cvimg_to_qimage, draw_annotations, find_orthogonal_projection, ensure_bgr_u8, mask_to_polys,load_mask_png
-from .qt_workers import DetectionWorker, MODEL_PATH, FinetuneWorker
+from .qt_workers import SegWorker, SegFinetuneWorker, DetectionWorker, DetectFinetuneWorker, SAM2_UNET_MODEL_PATH, YOLO_MODEL_PATH
 
 from ultralytics import YOLO
+
+from src.deep_learning.models.SAMUNET import LitBinarySeg, SAM2UNet
 
 
 class FrameSource:
@@ -103,7 +105,7 @@ class Base(QtWidgets.QMainWindow):
         self.total_frames: int = 0
         self.current_idx: int = 0
         self.current_frame_bgr: Optional[np.ndarray] = None
-        # self.video_path: Optional[str] = None
+        self.src_path: Optional[str] = None
         self.play_timer = QtCore.QTimer(self)
         self.play_timer.timeout.connect(self._on_play_tick)
         self.playing = False
@@ -122,6 +124,7 @@ class Base(QtWidgets.QMainWindow):
 
         # Dataset (verified only)
         self.dataset: Dict[int, List[PolyClass]] = {}      # frame_idx -> verified boxes
+        self.dataset_images_names: Dict[int, str] = {}  # frame_idx -> image filename
 
         # For click->image coord mapping
         self.draw_map = {"scale": 1.0, "xoff": 0, "yoff": 0}
@@ -193,7 +196,7 @@ class Base(QtWidgets.QMainWindow):
         self.inference_conf_tresh = QtWidgets.QDoubleSpinBox()
         self.inference_conf_tresh.setRange(0.01, 0.99)
         self.inference_conf_tresh.setSingleStep(0.05)
-        self.inference_conf_tresh.setValue(0.05)
+        self.inference_conf_tresh.setValue(0.5)
         self.inference_conf_tresh.setPrefix("conf=")
 
         self.frame_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
@@ -245,7 +248,7 @@ class Base(QtWidgets.QMainWindow):
         # Shortcuts
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Left), self, activated=self.prev_frame)
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Right), self, activated=self.next_frame)
-        QtGui.QShortcut(QtGui.QKeySequence("Space"), self, activated=self.toggle_play_pause)
+        # QtGui.QShortcut(QtGui.QKeySequence("Space"), self, activated=self.toggle_play_pause)
         QtGui.QShortcut(QtGui.QKeySequence("V"), self, activated=self.verify_selected_toggle)
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Delete), self, activated=self.delete_selected)
         QtGui.QShortcut(QtGui.QKeySequence("N"), self, activated=self.start_add_mode)
@@ -257,7 +260,8 @@ class Base(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("0"), self, activated=self.zoom_fit)
 
 
-        self.model_worker = DetectionWorker
+        self.model_worker = None
+        self.model_path = None
 
 
     # ---------- Build GUI ----------
@@ -403,11 +407,13 @@ class Base(QtWidgets.QMainWindow):
 
         self.pred_cache.clear()
         self.dataset.clear()
+        self.dataset_images_names.clear()
         self.selected_idx = None
         self.mode = "select"
         self.temp_poly_pts.clear()
         self.source = src
         self.total_frames = src.count()
+        self.src_path = getattr(src, "path", None)
         self.current_idx = 0
         self.frame_slider.setRange(0, max(0, self.total_frames - 1))
         self.frame_slider.setValue(0)
@@ -556,7 +562,7 @@ class Base(QtWidgets.QMainWindow):
             return
         base = self.current_frame_bgr
         annots = self.pred_cache.get(self.current_idx, [])
-        annotated = draw_annotations(base, annots, self.inference_conf_tresh.value(), self.class_names, self.selected_idx)
+        annotated = draw_annotations(base, annots, self.inference_conf_tresh.value(), self.class_names, self.selected_idx, show_conf=False, show_label=False)
 
         # --- ghost for ADD mode ---
         if self.mode == "add" and len(self.temp_poly_pts) > 0:
@@ -615,22 +621,22 @@ class Base(QtWidgets.QMainWindow):
 
     # ---------- Inference with cache ----------
     def run_model_cached(self):
-        """Only run model if no cache exists for this frame"""
+        # """Only run model if no cache exists for this frame"""
         idx = self.current_idx
-        if idx in self.pred_cache and len(self.pred_cache[idx]) > 0:
-            self.info("Using cached predictions for this frame.")
-            self.redraw_current()
-            return
+        # if idx in self.pred_cache and len(self.pred_cache[idx]) > 0 :
+        #     self.info("Using cached predictions for this frame.")
+        #     self.redraw_current()
+        #     return
 
         if self.current_frame_bgr is None:
             return
 
         self.run_btn.setEnabled(False)
         self.run_btn.setText("Inference running...")
-        # conf = float(self.inference_conf_tresh.value())
+        conf = float(self.inference_conf_tresh.value())
 
         self.worker_thread = QtCore.QThread(self)
-        self.worker = self.model_worker(idx, self.current_frame_bgr, conf=0.01, model_path=MODEL_PATH)
+        self.worker = self.model_worker(idx, self.current_frame_bgr, conf=conf, model_path=self.model_path)
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
         self.worker.finished.connect(self._on_inference_done)
@@ -641,10 +647,16 @@ class Base(QtWidgets.QMainWindow):
         self.worker_thread.finished.connect(self.worker_thread.deleteLater)
         self.worker_thread.start()
 
+    def init_model(self, model_path: str):
+        raise NotImplementedError("init_model must be implemented in subclass.")
+    
+    def launch_finetune_worker(self, base_model: str):
+        raise NotImplementedError("launch_finetune_worker must be implemented in subclass.")
+    
     def finetune_model(self):
 
-        if not self.video_path:
-            QtWidgets.QMessageBox.warning(self, "Fine-tune", "Load a video first.")
+        if not self.src_path:
+            QtWidgets.QMessageBox.warning(self, "Fine-tune", "Load a source first.")
             return
         if not self.dataset:
             QtWidgets.QMessageBox.warning(self, "Fine-tune", "No verified annotations to train on.")
@@ -652,28 +664,16 @@ class Base(QtWidgets.QMainWindow):
         if not self.class_names:
             QtWidgets.QMessageBox.warning(self, "Fine-tune", "No class names defined.")
             return
-
-        # first export validated dataset to json
-        self.save_dataset_json()
     
         self.finetune_btn.setEnabled(False)
         self.finetune_btn.setText("Finetuning...")
 
             # choose a base OBB model, e.g., 'yolo11n-obb.pt'
-        base_model = MODEL_PATH  # or a file dialog / settings
+        base_model = self.model_path  # or a file dialog / settings
 
+        
         self.finetune_thread = QtCore.QThread(self)
-        self.finetune_worker = FinetuneWorker(
-            video_path=self.video_path,
-            dataset=self.dataset,
-            class_names=self.class_names,
-            base_model_path=base_model,
-            out_root=os.path.join(os.getcwd(), "finetune_runs"),
-            epochs=20,
-            imgsz=640,
-            batch=16,
-            val_split=0.1,
-        )
+        self.finetune_worker = self.launch_finetune_worker(base_model)
         self.finetune_worker.moveToThread(self.finetune_thread)
 
         # connect signals
@@ -699,7 +699,7 @@ class Base(QtWidgets.QMainWindow):
         self.info_label.setText(f"Fine-tune complete: {best_pt_path}")
         # Optionally load the new weights right away:
         try:
-            DetectionWorker._model = YOLO(best_pt_path)
+            DetectionWorker._model = self.init_model(best_pt_path)
             self.info_label.setText(f"Loaded fine-tuned model: {os.path.basename(best_pt_path)}")
         except Exception as e:
             self.info_label.setText(f"Model saved, but failed to load: {e}")
@@ -714,7 +714,7 @@ class Base(QtWidgets.QMainWindow):
         if frame_idx == self.current_idx:
             self.redraw_current()
         self.run_btn.setEnabled(True)
-        self.run_btn.setText("Run Model (cached)")
+        self.run_btn.setText("Run Model")
         self.info(f"Predictions cached for frame {frame_idx+1}.")
 
     def _on_inference_error(self, msg: str):
@@ -963,6 +963,8 @@ class Base(QtWidgets.QMainWindow):
         """Keep dataset = verified & not deleted boxes only."""
         all_boxes = self.pred_cache.get(frame_idx, [])
         self.dataset[frame_idx] = [b for b in all_boxes if (b.verified and not b.deleted)]
+        if isinstance(self.source, ImageFolderSource):
+            self.dataset_images_paths[frame_idx] = self.source.path_at(frame_idx)
 
     # ---------- Save dataset ----------
     def save_dataset_json(self):
@@ -975,7 +977,7 @@ class Base(QtWidgets.QMainWindow):
         if not path:
             return
         data: Dict[str, Any] = {
-            "video_path": self.video_path,
+            "video_path": self.src_path,
             "total_frames": self.total_frames,
             "frames": []
         }
@@ -1142,7 +1144,7 @@ class Base(QtWidgets.QMainWindow):
         self.temp_poly_pts.append([x, y])
         first_point = self.temp_poly_pts[0]
 
-        if len(self.temp_poly_pts) > 1 and np.linalg.norm(np.array([x, y]) - np.array(first_point)) < 5.0:
+        if len(self.temp_poly_pts) > 2 and np.linalg.norm(np.array([x, y]) - np.array(first_point)) < 8.0:
             # close polygon if near first point
             self.temp_poly_pts[-1] = first_point
 
@@ -1157,8 +1159,10 @@ class Base(QtWidgets.QMainWindow):
 
 
 class OBB_VideoPlayer(Base):
-    def __init__(self):
+    def __init__(self, model_path: str = YOLO_MODEL_PATH):
         super().__init__()
+        self.model_path = model_path
+        self.model_worker = DetectionWorker
 
     # ---------- Add-box pipeline (4 clicks) ----------
     def add_click_point(self, x: float, y: float):
@@ -1179,6 +1183,55 @@ class OBB_VideoPlayer(Base):
             self.temp_poly_pts.append([x, y])
 
         self.redraw_current()
+    
 
+    def init_model(self, model_path: str):
+        # load OBB model
+        model = YOLO(model_path)
+        return model
+
+    def launch_finetune_worker(self, base_model: str):
+
+        return DetectFinetuneWorker(
+            video_path=self.src_path,
+            dataset=self.dataset,
+            class_names=self.class_names,
+            base_model_path=base_model,
+            out_root=os.path.join(os.getcwd(), "finetune_runs"),
+            epochs=20,
+            imgsz=640,
+            batch=16,
+            val_split=0.1,
+        )
+    
+class Seg_VideoPlayer(Base):
+    def __init__(self, model_path: str = SAM2_UNET_MODEL_PATH):
+        super().__init__()
+        self.model_path = model_path
+        self.model_worker = SegWorker
+
+    def init_model(self, model_path: str):
+
+        net = SAM2UNet(config="tiny", sam_checkpoint_path="src/sam2/checkpoints/sam2.1_hiera_tiny.pt", freeze_encorder = True).to("cuda")
+        lit = LitBinarySeg.load_from_checkpoint("logs/tiny_freeze_for_noisy_detect/epoch=94-step=3515.ckpt", 
+                                            net=net,
+                                            deep_supervision=False,
+                                            dice_use_all_outputs=False,      # mets True si tu veux la Dice moyenne (out,out1,out2)
+                                            pos_weight=200).eval().to("cuda")
+        return lit
+    
+    def launch_finetune_worker(self, base_model: str):
+        
+        return SegFinetuneWorker(
+            video_path=self.src_path,
+            dataset=self.dataset,
+            dataset_images_paths=self.dataset_images_paths,
+            base_model_path=base_model,
+            out_root=os.path.join(os.getcwd(), "seg_finetune_runs"),
+            epochs=20,
+            imgsz=514,
+            batch=8,
+            val_split=0.1,
+        )
 
     

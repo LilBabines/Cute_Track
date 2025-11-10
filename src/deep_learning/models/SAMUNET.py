@@ -15,7 +15,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sam2.build_sam import build_sam2
 import lightning as L
-from torchvision.transforms import ToTensor, RandomVerticalFlip, RandomHorizontalFlip, Compose, Normalize
 from torch.utils.data import DataLoader, Dataset
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch import Trainer
@@ -156,7 +155,7 @@ class RFB_modified(nn.Module):
 
 
 class SAM2UNet(nn.Module):
-    def __init__(self, config= "small", sam_checkpoint_path=None, freeze_encorder = False) -> None:
+    def __init__(self, config= "small", pl_sam2Unet_checkpoint_path = None,sam_checkpoint_path=None, freeze_encorder = False) -> None:
         super(SAM2UNet, self).__init__()    
         self.size = config
         if config in ["small", "tiny", "large"]:
@@ -165,10 +164,11 @@ class SAM2UNet(nn.Module):
             sam_config = "sam2_hiera_b+.yaml"
         else:
             raise ValueError(f"Unknown config {config}", "expected small, tiny, base, large")
-        if sam_checkpoint_path:
+        if sam_checkpoint_path and not pl_sam2Unet_checkpoint_path:
             model = build_sam2(sam_config, sam_checkpoint_path)
         else:
             model = build_sam2(sam_config)
+        
         del model.sam_mask_decoder
         del model.sam_prompt_encoder
         del model.memory_encoder
@@ -178,6 +178,11 @@ class SAM2UNet(nn.Module):
         del model.obj_ptr_proj
         del model.image_encoder.neck
         self.encoder = model.image_encoder.trunk
+
+        if pl_sam2Unet_checkpoint_path:
+                checkpoint = torch.load(pl_sam2Unet_checkpoint_path)
+                net_weights = {k[4:]: v for k, v in checkpoint["state_dict"].items() if k.startswith("net.")}
+                model.load_state_dict(net_weights)
 
         for param in self.encoder.parameters():
             param.requires_grad = not freeze_encorder

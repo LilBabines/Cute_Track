@@ -60,6 +60,8 @@ class DataSet512Mask(Dataset):
             image, mask = self.augment_3(image), self.augment_3(mask)
         else :
             image, mask = self.augment_1(image), self.augment_1(mask)
+
+        print(image.shape, mask.shape)
         return {"image":image, "mask":mask, "idx":idx, "img_name":self.img_names[idx]}
     
     def plot(self,idx):
@@ -146,7 +148,7 @@ def compute_global_pos_weight(dataloader):  # dataloader de train
 
 
 if __name__ == "__main__":
-    dataset_path = "/home/auguste/Desktop/Cute_Track/datasets/sam-unext_dataset"
+    dataset_path = "/home/auguste/Desktop/Cute_Track/datasets/Train_005"
     data_module = DataModule512Mask(dataset_path, batch_size=4)
     data_module.setup()
     train_loader = data_module.train_dataloader()

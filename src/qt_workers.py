@@ -11,19 +11,33 @@ try:
 except ImportError:
     YOLO = None
 
+#SAM2-UNet
+from src.deep_learning.models.SAMUNET import SAM2UNet, LitBinarySeg
+import torch
+from torchvision.transforms import ToTensor, Normalize, Compose, Resize
+from lightning.pytorch.callbacks import ModelCheckpoint
+from src.deep_learning.dataset.dataset import DataModule512Mask
+from lightning.pytorch import Trainer
+from lightning.pytorch.loggers import TensorBoardLogger
 import cv2
 
 # ------ Local imports from utils.py ------
-from .utils import OBBOX, rect_to_poly_xyxy
+from .utils import OBBOX, PolyClass, rect_to_poly_xyxy, mask_to_polys
 
 
-MODEL_PATH = "yolo11n-obb.pt"  # your OBB checkpoint
-
+YOLO_MODEL_PATH = "yolo11n-obb.pt"  # your OBB checkpoint
+SAM2_UNET_MODEL_PATH = "./models/tiny_last.ckpt"  # your SAM2 UNet checkpoint
+    
 class DetectionWorker(QtCore.QObject):
+    """
+    Worker for performing object detection on a frame using YOLO-OBB.
+    Signals:
+        finished(int, List[str], List[OBBOX])  # frame_idx, class_names, List of detected OBBOX
+        error(str)
+    """
     finished = QtCore.Signal(object, object, object)  # (frame_idx, class_names, List[AnnotBox])
     error = QtCore.Signal(str)
-
-    def __init__(self, frame_idx: int, frame_bgr: np.ndarray, conf: float = 0.01, model_path: str = MODEL_PATH):
+    def __init__(self, frame_idx: int, frame_bgr: np.ndarray, conf: float = 0.5, model_path: str = YOLO_MODEL_PATH):
         super().__init__()
         self.frame_idx = frame_idx
         self.frame_bgr = frame_bgr
@@ -93,7 +107,7 @@ class DetectionWorker(QtCore.QObject):
 
 
 
-class FinetuneWorker(QtCore.QObject):
+class DetectFinetuneWorker(QtCore.QObject):
     """
     Build a YOLO-OBB dataset from verified polygons and fine-tune the model.
     Signals:
@@ -117,6 +131,7 @@ class FinetuneWorker(QtCore.QObject):
         batch: int = 16,
         val_split: float = 0.1,
         seed: int = 1337,
+        dataset_images_paths: Dict[int, str] = None,
     ):
         super().__init__()
         self.video_path = video_path
@@ -132,7 +147,7 @@ class FinetuneWorker(QtCore.QObject):
 
     @QtCore.Slot()
     def run(self):
-        # try:
+        try:
             # --- checks ---
             if YOLO is None:
                 raise RuntimeError("Ultralytics is not installed. `pip install ultralytics`")
@@ -274,5 +289,148 @@ class FinetuneWorker(QtCore.QObject):
             self.progress.emit("Training complete.", 0.99)
             self.finished.emit(best_pt)
 
-        # except Exception as e:
-        #     self.error.emit(str(e))
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class SegWorker(QtCore.QObject):
+    """
+    Worker for performing segmentation on a frame using SAM2-UNet LightingModule.
+    Signals:
+        finished(int, np.ndarray)  # frame_idx, segmentation mask
+        error(str)
+    """
+    finished = QtCore.pyqtSignal(object, object, object)  # (frame_idx, class_names, List[AnnotBox])
+    error = QtCore.pyqtSignal(str)
+    def __init__(self, frame_idx: int, frame_bgr: np.ndarray, conf: float = 0.5, model_path: str = SAM2_UNET_MODEL_PATH):
+        super().__init__()
+        self.frame_idx = frame_idx
+        self.frame_bgr = frame_bgr
+        self.conf = conf
+        self.model_path = model_path
+        
+    def preprocess(self, frame_bgr: np.ndarray) -> torch.Tensor:
+
+        x = frame_bgr[..., ::-1].copy()
+        transform = Compose([
+            ToTensor(),
+            Resize((512, 512)),
+            Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        x = transform(x)
+        x = x.unsqueeze(0)  # add batch dim
+        return x
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            if not hasattr(SegWorker, "_model"):
+                if not os.path.isfile(self.model_path):
+                    raise FileNotFoundError(f"Model not found: {self.model_path}")
+                
+                net = SAM2UNet(config="tiny", sam_checkpoint_path="src/sam2/checkpoints/sam2.1_hiera_tiny.pt", freeze_encorder = True).to("cuda")
+                lit = LitBinarySeg.load_from_checkpoint("logs/tiny_freeze_for_noisy_detect/epoch=94-step=3515.ckpt", 
+                                                net=net,
+                                                deep_supervision=False,
+                                                dice_use_all_outputs=False,
+                                                pos_weight=200) 
+                lit.eval()
+                SegWorker._model = lit.to("cuda")
+
+            model = SegWorker._model
+            input_tensor = self.preprocess(self.frame_bgr).to("cuda")
+            with torch.no_grad():
+                res = model(input_tensor).sigmoid()
+            mask = (res[0, 0].cpu().numpy() > self.conf).astype(np.uint8) * 255  # Binary mask
+            polys = mask_to_polys(mask)
+            annot_polys = [OBBOX(poly=p, cls_id=0, conf=1.0) for p in polys]
+            names = ['Building']*len(annot_polys)
+            self.finished.emit(self.frame_idx, names, annot_polys)
+
+        except Exception as e:
+            self.error.emit(str(e))
+
+class SegFinetuneWorker(QtCore.QObject):
+    """
+    Worker for fine-tuning the SAM2-UNet model.
+    Signals:
+        progress(str, float)  # message, 0..1
+        finished(str)         # path to best.ckpt
+        error(str)
+    """
+    progress = QtCore.pyqtSignal(str, float)
+    finished = QtCore.pyqtSignal(str)
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(
+        self,
+        dataset: Dict[int, list[PolyClass]],   # frame_idx -> binary mask
+        dataset_images_paths: Dict[int, str],
+        base_model_path: str,
+        out_root: Optional[str] = None,
+        epochs: int = 10,
+        batch: int = 4,
+        valsplit: float = 0.1,
+        seed: int = 1337,
+    ):
+        super().__init__()
+        self.dataset = dataset
+        self.dataset_images_paths = dataset_images_paths
+        self.base_model_path = base_model_path
+        self.out_root = out_root or os.path.join(os.getcwd(), "seg_finetune_runs")
+        self.epochs = int(epochs)
+        self.batch = int(batch)
+        self.valsplit = float(valsplit)
+        self.seed = int(seed)
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            # --- checks ---
+            if not os.path.isfile(self.base_model_path):
+                raise FileNotFoundError(f"Base model not found: {self.base_model_path}")
+            if not self.dataset or len(self.dataset) == 0:
+                raise ValueError("Dataset is empty; cannot proceed with fine-tuning. VERIFY annotations first.")
+            
+            self.progress.emit("Preparering dataset…", 0.02)
+
+            # --- prepare run dirs ---
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            exp_name = "finetune_seg"
+            run_dir = f"logs/{exp_name}/{ts}"
+            torch.manual_seed(42)
+            np.random.seed(42)
+
+            os.makedirs(run_dir, exist_ok=True)
+
+            #define callbacks
+            cb_checkpoint = ModelCheckpoint(
+                monitor="val/dice",
+                dirpath=run_dir,
+                save_top_k=1,
+                mode="max",
+            )
+
+            #initialize model, litmodule, trainer, datamodule
+            net = SAM2UNet(config="tiny", sam_checkpoint_path="src/sam2/checkpoints/sam2.1_hiera_tiny.pt", freeze_encorder = True).to("cuda")
+            lit = LitBinarySeg(
+                net,
+                deep_supervision=False,
+                dice_use_all_outputs=False,      # mets True si tu veux la Dice moyenne (out,out1,out2)
+                pos_weight=200                   # utile si classe rare
+            )
+            trainer = Trainer(accelerator="auto", devices=1, 
+                            max_epochs=100,
+                            logger=TensorBoardLogger(save_dir=run_dir, name=exp_name, version=f"{ts}/tensorboard"),
+                            callbacks=[cb_checkpoint])
+            
+            data_module = DataModule512Mask(
+                dataset_path="datasets/Train_005",
+                batch_size=self.batch,
+                num_workers=4,
+                keep_pourcent=1
+            )
+
+            trainer.fit(lit, ckpt_path=SAM2_UNET_MODEL_PATH, datamodule=data_module)
+        except Exception as e:
+            self.error.emit(str(e))
