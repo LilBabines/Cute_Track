@@ -122,6 +122,14 @@ def mask_to_polys(mask: np.ndarray,
 
     return polys
 
+def polys_to_mask(polys: List[PolyClass], img_shape: tuple[int, int]) -> np.ndarray:
+    """Convertit une liste de polygone (M,N,2) en masque binaire (H,W) uint8."""
+    H, W = img_shape
+    mask = np.zeros((H, W), dtype=np.uint8)
+    pts = [p.poly.astype(np.int32) for p in polys]
+    cv2.fillPoly(mask, pts, color=255)
+    return mask
+
 @dataclass
 class OBBOX(PolyClass):
     """Annotation container for oriented bounding boxes (4-point polygons)."""

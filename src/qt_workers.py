@@ -22,7 +22,7 @@ from lightning.pytorch.loggers import TensorBoardLogger
 import cv2
 
 # ------ Local imports from utils.py ------
-from .utils import OBBOX, PolyClass, rect_to_poly_xyxy, mask_to_polys
+from .utils import OBBOX, PolyClass, rect_to_poly_xyxy, mask_to_polys, polys_to_mask
 
 
 YOLO_MODEL_PATH = "yolo11n-obb.pt"  # your OBB checkpoint
@@ -285,7 +285,7 @@ class DetectFinetuneWorker(QtCore.QObject):
                     best_pt = last_pt
                 else:
                     raise RuntimeError("Training finished but no weights found.")
-
+            self.progress.emit("Launching training…", 0.70)
             self.progress.emit("Training complete.", 0.99)
             self.finished.emit(best_pt)
 
@@ -308,6 +308,7 @@ class SegWorker(QtCore.QObject):
         self.frame_bgr = frame_bgr
         self.conf = conf
         self.model_path = model_path
+        print("SegWorker initialized with model path:", model_path)
         
     def preprocess(self, frame_bgr: np.ndarray) -> torch.Tensor:
 
@@ -327,9 +328,9 @@ class SegWorker(QtCore.QObject):
             if not hasattr(SegWorker, "_model"):
                 if not os.path.isfile(self.model_path):
                     raise FileNotFoundError(f"Model not found: {self.model_path}")
-                
+                print("no _model attribute, loading model from:", self.model_path)
                 net = SAM2UNet(config="tiny", sam_checkpoint_path="src/sam2/checkpoints/sam2.1_hiera_tiny.pt", freeze_encorder = True).to("cuda")
-                lit = LitBinarySeg.load_from_checkpoint("logs/tiny_freeze_for_noisy_detect/epoch=94-step=3515.ckpt", 
+                lit = LitBinarySeg.load_from_checkpoint(self.model_path, 
                                                 net=net,
                                                 deep_supervision=False,
                                                 dice_use_all_outputs=False,
@@ -365,22 +366,22 @@ class SegFinetuneWorker(QtCore.QObject):
     def __init__(
         self,
         dataset: Dict[int, list[PolyClass]],   # frame_idx -> binary mask
-        dataset_images_paths: Dict[int, str],
+        dataset_images_names: Dict[int, str],
         base_model_path: str,
         out_root: Optional[str] = None,
         epochs: int = 10,
         batch: int = 4,
-        valsplit: float = 0.1,
+        val_split: float = 0.1,
         seed: int = 1337,
     ):
         super().__init__()
         self.dataset = dataset
-        self.dataset_images_paths = dataset_images_paths
+        self.dataset_images_names = dataset_images_names
         self.base_model_path = base_model_path
         self.out_root = out_root or os.path.join(os.getcwd(), "seg_finetune_runs")
         self.epochs = int(epochs)
         self.batch = int(batch)
-        self.valsplit = float(valsplit)
+        self.val_split = float(val_split)
         self.seed = int(seed)
 
     @QtCore.pyqtSlot()
@@ -403,6 +404,30 @@ class SegFinetuneWorker(QtCore.QObject):
 
             os.makedirs(run_dir, exist_ok=True)
 
+            # --- prepare dataset at datasets/seg_finetune/data{ts} ---
+            self.progress.emit("Preparing dataset…", 0.05)
+            dataset = self.dataset
+            dataset_images_names = self.dataset_images_names
+            os.makedirs("datasets/seg_finetune", exist_ok=True)
+            data_dir = f"datasets/seg_finetune/data_{ts}"
+            os.makedirs(data_dir, exist_ok=True)
+            data_dir_images = os.path.join(data_dir, "images")
+            os.makedirs(data_dir_images, exist_ok=True)
+            data_dir_masks =  os.path.join(data_dir, "GT_Object")
+            os.makedirs(data_dir_masks, exist_ok=True)
+
+            for frame_idx, polys in dataset.items():
+                img_src_path = dataset_images_names.get(frame_idx, None)
+                if img_src_path is None or not os.path.isfile(img_src_path):
+                    continue
+                img_dst_path = os.path.join(data_dir_images, os.path.basename(img_src_path))
+                cv2.imwrite(img_dst_path, cv2.imread(img_src_path))
+                # create mask
+                mask = polys_to_mask(polys, (512, 512))
+                
+                mask_dst_path = os.path.join(data_dir_masks, f"frame_{frame_idx:06d}_mask.png")
+                cv2.imwrite(mask_dst_path, mask)
+
             #define callbacks
             cb_checkpoint = ModelCheckpoint(
                 monitor="val/dice",
@@ -413,24 +438,29 @@ class SegFinetuneWorker(QtCore.QObject):
 
             #initialize model, litmodule, trainer, datamodule
             net = SAM2UNet(config="tiny", sam_checkpoint_path="src/sam2/checkpoints/sam2.1_hiera_tiny.pt", freeze_encorder = True).to("cuda")
-            lit = LitBinarySeg(
-                net,
+            lit = LitBinarySeg.load_from_checkpoint(
+                self.base_model_path,
+                net=net,
                 deep_supervision=False,
                 dice_use_all_outputs=False,      # mets True si tu veux la Dice moyenne (out,out1,out2)
                 pos_weight=200                   # utile si classe rare
             )
             trainer = Trainer(accelerator="auto", devices=1, 
-                            max_epochs=100,
+                            max_epochs=10,
                             logger=TensorBoardLogger(save_dir=run_dir, name=exp_name, version=f"{ts}/tensorboard"),
                             callbacks=[cb_checkpoint])
             
             data_module = DataModule512Mask(
-                dataset_path="datasets/Train_005",
+                dataset_path="datasets/seg_finetune/data_"+ts,
                 batch_size=self.batch,
-                num_workers=4,
-                keep_pourcent=1
+                val_split=self.val_split
             )
 
-            trainer.fit(lit, ckpt_path=SAM2_UNET_MODEL_PATH, datamodule=data_module)
+            trainer.fit(lit, datamodule=data_module)
+
+            self.progress.emit("Launching training…", 0.70)
+            self.progress.emit("Training complete.", 0.99)
+            self.finished.emit(cb_checkpoint.best_model_path)
+
         except Exception as e:
             self.error.emit(str(e))

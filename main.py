@@ -8,7 +8,7 @@ from src.deep_learning.models.SAMUNET import SAM2UNet, LitBinarySeg
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    w = OBB_VideoPlayer()
+    w = Seg_VideoPlayer()
     w.show()
     sys.exit(app.exec())
 

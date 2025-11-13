@@ -56,8 +56,8 @@ class ImageFolderSource(FrameSource):
     IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
     def __init__(self, folder: str):
-        self.folder = folder
-        files = [f for f in os.listdir(folder)]
+        self.path = folder
+        files = [f for f in os.listdir(self.path)]
         files = [f for f in files if os.path.splitext(f)[1].lower() in self.IMAGE_EXTS]
         if not files:
             raise RuntimeError("No images found in folder.")
@@ -66,7 +66,7 @@ class ImageFolderSource(FrameSource):
             import re
             return [int(t) if t.isdigit() else t.lower() for t in re.findall(r'\d+|\D+', s)]
         files.sort(key=_key)
-        self.paths = [os.path.join(folder, f) for f in files]
+        self.paths = [os.path.join(self.path, f) for f in files]
 
     def count(self) -> int:
         return len(self.paths)
@@ -85,7 +85,7 @@ class ImageFolderSource(FrameSource):
         return 10.0
 
     def name(self) -> str:
-        return os.path.basename(self.folder)
+        return os.path.basename(self.path)
     
     def path_at(self, idx: int) -> str:
         idx = max(0, min(idx, len(self.paths) - 1))
@@ -636,6 +636,8 @@ class Base(QtWidgets.QMainWindow):
         conf = float(self.inference_conf_tresh.value())
 
         self.worker_thread = QtCore.QThread(self)
+
+        print("Launching inference worker...", self.model_path)
         self.worker = self.model_worker(idx, self.current_frame_bgr, conf=conf, model_path=self.model_path)
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
@@ -699,7 +701,8 @@ class Base(QtWidgets.QMainWindow):
         self.info_label.setText(f"Fine-tune complete: {best_pt_path}")
         # Optionally load the new weights right away:
         try:
-            DetectionWorker._model = self.init_model(best_pt_path)
+            self.model_worker._model = self.init_model(best_pt_path)
+            self.model_path = best_pt_path
             self.info_label.setText(f"Loaded fine-tuned model: {os.path.basename(best_pt_path)}")
         except Exception as e:
             self.info_label.setText(f"Model saved, but failed to load: {e}")
@@ -964,7 +967,7 @@ class Base(QtWidgets.QMainWindow):
         all_boxes = self.pred_cache.get(frame_idx, [])
         self.dataset[frame_idx] = [b for b in all_boxes if (b.verified and not b.deleted)]
         if isinstance(self.source, ImageFolderSource):
-            self.dataset_images_paths[frame_idx] = self.source.path_at(frame_idx)
+            self.dataset_images_names[frame_idx] = self.source.path_at(frame_idx)
 
     # ---------- Save dataset ----------
     def save_dataset_json(self):
@@ -1223,13 +1226,11 @@ class Seg_VideoPlayer(Base):
     def launch_finetune_worker(self, base_model: str):
         
         return SegFinetuneWorker(
-            video_path=self.src_path,
             dataset=self.dataset,
-            dataset_images_paths=self.dataset_images_paths,
+            dataset_images_names=self.dataset_images_names,
             base_model_path=base_model,
             out_root=os.path.join(os.getcwd(), "seg_finetune_runs"),
             epochs=20,
-            imgsz=514,
             batch=8,
             val_split=0.1,
         )

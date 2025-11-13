@@ -31,7 +31,6 @@ class DataSet512Mask(Dataset):
         self.transform_mask = Compose([self.transform, lambda_transform])
         self.images = sorted(images_paths)
         self.masks = sorted(masks_paths)
-
         if keep_pourcent < 1:
             keep_size = int(len(self.images)*keep_pourcent)
             random_idx = np.random.choice(len(self.images), keep_size, replace=False)
@@ -60,8 +59,6 @@ class DataSet512Mask(Dataset):
             image, mask = self.augment_3(image), self.augment_3(mask)
         else :
             image, mask = self.augment_1(image), self.augment_1(mask)
-
-        print(image.shape, mask.shape)
         return {"image":image, "mask":mask, "idx":idx, "img_name":self.img_names[idx]}
     
     def plot(self,idx):
@@ -83,12 +80,13 @@ class DataSet512Mask(Dataset):
 
 class DataModule512Mask(L.LightningDataModule):
 
-    def __init__(self, dataset_path, batch_size=8, num_workers=4, keep_pourcent=1):
+    def __init__(self, dataset_path, batch_size=8, num_workers=4, keep_pourcent=1, val_split=0.2):
         super().__init__()
         self.dataset_path = dataset_path
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.keep_pourcent = keep_pourcent
+        self.keep_pourcent = keep_pourcent,
+        self.val_split = val_split
 
     def setup(self, stage=None):
 
@@ -96,8 +94,8 @@ class DataModule512Mask(L.LightningDataModule):
         masks_files = np.array(sorted(glob.glob(os.path.join(self.dataset_path, "GT_Object", "*.png"))))
 
         np.random.seed(42)
-        train_idx = np.random.choice(len(images_files), int(0.8*len(images_files)), replace=False)
-        val_idx = np.array([i for i in range(len(images_files)) if i not in train_idx])
+        # train_idx = np.random.choice(len(images_files), int((1 - self.val_split)*len(images_files)), replace=False)
+        # val_idx = np.array([i for i in range(len(images_files)) if i not in train_idx])
 
         # train_idx_2_pourcent = np.random.choice(train_idx, max(10, int(0.000005*len(train_idx))), replace=False)
         # train_idx = train_idx_2_pourcent
@@ -105,20 +103,20 @@ class DataModule512Mask(L.LightningDataModule):
         # val_idx_2_pourcent = np.random.choice(val_idx, max(12, int(0.000005*len(val_idx))), replace=False)
         # val_idx = val_idx_2_pourcent
 
-        train_images = images_files[train_idx]
-        train_masks = masks_files[train_idx]
-        val_images = images_files[val_idx]
-        val_masks = masks_files[val_idx]
+        # train_images = images_files[train_idx]
+        # train_masks = masks_files[train_idx]
+        # val_images = images_files[val_idx]
+        # val_masks = masks_files[val_idx]
 
         self.train_dataset = DataSet512Mask(
-            images_paths=train_images,
-            masks_paths=train_masks,
-            keep_pourcent=self.keep_pourcent
+            images_paths=images_files,
+            masks_paths=masks_files,
+            keep_pourcent=1
         )
         self.val_dataset = DataSet512Mask(
-            images_paths=val_images,
-            masks_paths=val_masks,
-            keep_pourcent=self.keep_pourcent
+            images_paths=images_files,
+            masks_paths=masks_files,
+            keep_pourcent=1
         )
         
 
