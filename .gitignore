@@ -228,3 +228,4 @@ datasets/
 checkpoints/
 *.ckpt
 *logs/
+*.mp3
