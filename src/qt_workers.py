@@ -300,8 +300,8 @@ class SegWorker(QtCore.QObject):
         finished(int, np.ndarray)  # frame_idx, segmentation mask
         error(str)
     """
-    finished = QtCore.pyqtSignal(object, object, object)  # (frame_idx, class_names, List[AnnotBox])
-    error = QtCore.pyqtSignal(str)
+    finished = QtCore.Signal(object, object, object)  # (frame_idx, class_names, List[AnnotBox])
+    error = QtCore.Signal(str)
     def __init__(self, frame_idx: int, frame_bgr: np.ndarray, conf: float = 0.5, model_path: str = SAM2_UNET_MODEL_PATH):
         super().__init__()
         self.frame_idx = frame_idx
@@ -359,9 +359,9 @@ class SegFinetuneWorker(QtCore.QObject):
         finished(str)         # path to best.ckpt
         error(str)
     """
-    progress = QtCore.pyqtSignal(str, float)
-    finished = QtCore.pyqtSignal(str)
-    error = QtCore.pyqtSignal(str)
+    progress = QtCore.Signal(str, float)
+    finished = QtCore.Signal(str)
+    error = QtCore.Signal(str)
 
     def __init__(
         self,
