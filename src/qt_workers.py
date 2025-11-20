@@ -25,7 +25,7 @@ import cv2
 from .utils import OBBOX, PolyClass, rect_to_poly_xyxy, mask_to_polys, polys_to_mask
 
 
-YOLO_MODEL_PATH = "yolo11n-obb.pt"  # your OBB checkpoint
+YOLO_MODEL_PATH = "./models/best.pt"  # your OBB checkpoint
 SAM2_UNET_MODEL_PATH = "./models/tiny_last.ckpt"  # your SAM2 UNet checkpoint
     
 class DetectionWorker(QtCore.QObject):
