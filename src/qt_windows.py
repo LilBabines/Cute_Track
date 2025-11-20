@@ -4,7 +4,7 @@ from typing import Optional, List, Dict, Any
 
 import cv2
 import numpy as np
-from PyQt6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 # ------ Local imports from utils.py ------
 from .utils import PolyClass,OBBOX, cvimg_to_qimage, draw_annotations, find_orthogonal_projection

@@ -3,7 +3,7 @@ from typing import Dict, List, Optional
 import time
 
 import numpy as np
-from PyQt6 import QtCore
+from PySide6 import QtCore
 
 # -------- YOLO (Ultralytics) --------
 try:
@@ -17,11 +17,11 @@ import cv2
 from .utils import OBBOX, rect_to_poly_xyxy
 
 
-MODEL_PATH = "./best.pt"  # your OBB checkpoint
+MODEL_PATH = "yolo11n-obb.pt"  # your OBB checkpoint
 
 class DetectionWorker(QtCore.QObject):
-    finished = QtCore.pyqtSignal(object, object, object)  # (frame_idx, class_names, List[AnnotBox])
-    error = QtCore.pyqtSignal(str)
+    finished = QtCore.Signal(object, object, object)  # (frame_idx, class_names, List[AnnotBox])
+    error = QtCore.Signal(str)
 
     def __init__(self, frame_idx: int, frame_bgr: np.ndarray, conf: float = 0.01, model_path: str = MODEL_PATH):
         super().__init__()
@@ -30,15 +30,15 @@ class DetectionWorker(QtCore.QObject):
         self.conf = conf
         self.model_path = model_path
 
-    @QtCore.pyqtSlot()
+    @QtCore.Slot()
     def run(self):
         try:
             if YOLO is None:
                 raise RuntimeError("Ultralytics is not installed. `pip install ultralytics`")
 
             if not hasattr(DetectionWorker, "_model"):
-                if not os.path.isfile(self.model_path):
-                    raise FileNotFoundError(f"Model not found: {self.model_path}")
+                # if not os.path.isfile(self.model_path):
+                #     raise FileNotFoundError(f"Model not found: {self.model_path}")
                 DetectionWorker._model = YOLO(self.model_path)
 
             model = DetectionWorker._model
@@ -101,9 +101,9 @@ class FinetuneWorker(QtCore.QObject):
         finished(str)         # path to best.pt
         error(str)
     """
-    progress = QtCore.pyqtSignal(str, float)
-    finished = QtCore.pyqtSignal(str)
-    error = QtCore.pyqtSignal(str)
+    progress = QtCore.Signal(str, float)
+    finished = QtCore.Signal(str)
+    error = QtCore.Signal(str)
 
     def __init__(
         self,
@@ -130,7 +130,7 @@ class FinetuneWorker(QtCore.QObject):
         self.val_split = float(val_split)
         self.seed = int(seed)
 
-    @QtCore.pyqtSlot()
+    @QtCore.Slot()
     def run(self):
         # try:
             # --- checks ---

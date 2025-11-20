@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 import cv2
 import numpy as np
-from PyQt6 import QtGui
+from PySide6 import QtGui
 
 def cvimg_to_qimage(img_bgr: np.ndarray) -> QtGui.QImage:
     if img_bgr is None:
