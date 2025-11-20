@@ -322,7 +322,7 @@ class SegWorker(QtCore.QObject):
         x = x.unsqueeze(0)  # add batch dim
         return x
 
-    @QtCore.pyqtSlot()
+    @QtCore.Slot()
     def run(self):
         try:
             if not hasattr(SegWorker, "_model"):
@@ -384,7 +384,7 @@ class SegFinetuneWorker(QtCore.QObject):
         self.val_split = float(val_split)
         self.seed = int(seed)
 
-    @QtCore.pyqtSlot()
+    @QtCore.Slot()
     def run(self):
         try:
             # --- checks ---
