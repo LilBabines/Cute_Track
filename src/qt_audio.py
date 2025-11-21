@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QListWidget, QPushButton, QFileDialog, QMessageBox, QDialog,
     QFormLayout, QDialogButtonBox, QSpinBox, QComboBox, QLabel, 
-    QProgressDialog, QSplitter, QToolButton, QMenu
+    QProgressDialog, QSplitter, QToolButton, QMenu, QDoubleSpinBox
 )
 from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -31,13 +31,14 @@ from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.widgets import RectangleSelector
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 
 @dataclass
 class SpectrogramSettings:
     """Container for spectrogram parameters."""
     n_fft: int = 2048
-    hop_length: int = 512
+    hop_ms: float = 10.0         # hop duration in milliseconds (time resolution)
     cmap: str = "magma"
     max_freq: Optional[int] = None  # Hz, None means full range
 
@@ -53,7 +54,7 @@ class SpectrogramSettingsDialog(QDialog):
         # Copy initial settings so we do not modify them until the user presses OK
         self._settings = SpectrogramSettings(
             n_fft=settings.n_fft,
-            hop_length=settings.hop_length,
+            hop_ms=settings.hop_ms,
             cmap=settings.cmap,
             max_freq=settings.max_freq,
         )
@@ -71,12 +72,13 @@ class SpectrogramSettingsDialog(QDialog):
         self.n_fft_spin.setValue(self._settings.n_fft)
         form.addRow("FFT size (n_fft):", self.n_fft_spin)
 
-        # Hop length spin box
-        self.hop_spin = QSpinBox()
-        self.hop_spin.setRange(64, 8192)
-        self.hop_spin.setSingleStep(64)
-        self.hop_spin.setValue(self._settings.hop_length)
-        form.addRow("Hop length:", self.hop_spin)
+        # Hop duration in milliseconds (time resolution)
+        self.hop_ms_spin = QDoubleSpinBox()
+        self.hop_ms_spin.setRange(1.0, 500.0)      # 1 ms to 500 ms
+        self.hop_ms_spin.setSingleStep(1.0)
+        self.hop_ms_spin.setDecimals(1)
+        self.hop_ms_spin.setValue(self._settings.hop_ms)
+        form.addRow("Hop duration (ms):", self.hop_ms_spin)
 
         # Max frequency spin box
         self.max_freq_spin = QSpinBox()
@@ -104,33 +106,58 @@ class SpectrogramSettingsDialog(QDialog):
     def get_settings(self) -> SpectrogramSettings:
         """Return updated settings based on the dialog inputs."""
         self._settings.n_fft = int(self.n_fft_spin.value())
-        self._settings.hop_length = int(self.hop_spin.value())
+        self._settings.hop_ms = float(self.hop_ms_spin.value())
         maxf = int(self.max_freq_spin.value())
         self._settings.max_freq = maxf if maxf > 0 else None
         self._settings.cmap = self.cmap_combo.currentText()
         return self._settings
 
+    
 class SpectrogramCanvas(FigureCanvas):
     """
-    Matplotlib canvas responsible for drawing the spectrogram,
-    handling mouse-based zoom, and showing an audio playhead line.
-
-    Left mouse:
-        - Short click (no drag)  -> move playhead
-        - Drag (rectangle)       -> zoom
-
-    Right mouse:
-        - Click                  -> reset zoom
+    Dark, borderless spectrogram canvas with:
+        - DAW-style look (no frame, no title, minimal or no ticks)
+        - zoom rectangle (left-drag)
+        - right-click zoom reset
+        - playhead (vertical red line) updated via update_playhead()
+        - click vs drag detection (click moves playhead, drag zooms)
     """
 
-    # Emitted when the user clicks (without dragging) on the spectrogram (time in seconds)
+    # Emitted when the user left-clicks (without dragging) on the spectrogram (time in seconds)
     time_clicked = Signal(float)
 
     def __init__(self, parent=None):
+        # Create figure and a single axes
         fig = Figure(figsize=(6, 4))
         self.ax = fig.add_subplot(111)
+
         super().__init__(fig)
         self.setParent(parent)
+
+        # Dark theme for the whole figure
+        self.figure.patch.set_facecolor("#232323")
+        self.ax.set_facecolor("#232323")
+
+        # Remove all spines (no visible frame)
+        for spine in self.ax.spines.values():
+            spine.set_visible(False)
+
+        # No title
+        self.ax.set_title("")
+
+        # Optional: minimal ticks style (you can comment these out to remove ticks entirely)
+        self.ax.tick_params(
+            colors="white",
+            which="both",
+            direction="out",
+            length=2,
+            width=0.8,
+            labelsize=7,
+        )
+
+        # If you prefer NO tick labels at all (pure borderless visual), uncomment:
+        # self.ax.set_xticklabels([])
+        # self.ax.set_yticklabels([])
 
         # Full extents for zoom reset
         self._full_xlim = None
@@ -139,7 +166,7 @@ class SpectrogramCanvas(FigureCanvas):
         # Playhead (vertical red line)
         self.playhead_line = None
 
-        # Rectangle selector for zoom (left mouse)
+        # Rectangle selector for zoom (left mouse button)
         self.selector = RectangleSelector(
             self.ax,
             self.on_select_rectangle,
@@ -157,36 +184,65 @@ class SpectrogramCanvas(FigureCanvas):
         self._press_cid = self.mpl_connect("button_press_event", self._on_button_press)
         self._release_cid = self.mpl_connect("button_release_event", self._on_button_release)
 
-        # dB range (for info display)
-        self.db_min = None
-        self.db_max = None
-
-    # ---------- Spectrogram ----------
-
-    def plot_spectrogram(
-        self,
-        audio: np.ndarray,
-        sr: int,
-        settings,
-    ):
-        """Compute and draw the spectrogram of the given audio signal."""
-        # Clear figure and axis
+    # ------------------------------------------------------------------
+    # Spectrogram drawing
+    # ------------------------------------------------------------------
+    def plot_spectrogram(self, audio: np.ndarray, sr: int, settings):
+        """
+        Compute and draw the spectrogram of the given audio signal
+        in a DAW-style, borderless, dark canvas.
+        """
+        # Clear figure and recreate axes to remove old colorbars cleanly
         self.figure.clear()
         self.ax = self.figure.add_subplot(111)
-        self.playhead_line = None  # will be recreated
+
+        # Reapply dark theme and borderless style
+        self.figure.patch.set_facecolor("#232323")
+        self.ax.set_facecolor("#232323")
+
+        for spine in self.ax.spines.values():
+            spine.set_visible(False)
+
+        self.ax.set_title("")
+
+        self.ax.tick_params(
+            colors="white",
+            which="both",
+            direction="out",
+            length=2,
+            width=0.8,
+            labelsize=7,
+        )
+
+        # If you want completely borderless (no tick labels), uncomment:
+        # self.ax.set_xticklabels([])
+        # self.ax.set_yticklabels([])
+
+        self.playhead_line = None  # will be recreated for new spectrogram
 
         if audio is None or len(audio) == 0:
-            self.ax.set_title("No audio loaded")
+            self.ax.text(
+                0.5,
+                0.5,
+                "No audio loaded",
+                color="white",
+                ha="center",
+                va="center",
+                transform=self.ax.transAxes,
+            )
             self.draw()
             return
 
-        # Compute STFT using librosa
+        # --- Compute STFT using librosa ---
+        # Window size in samples
         n_fft = settings.n_fft
-        hop_length = settings.hop_length
+
+        # Time step (hop) in samples, computed from hop_ms so resolution is independent of file length
+        hop_length = max(1, int(sr * (settings.hop_ms / 1000.0)))
+
         S = librosa.stft(audio, n_fft=n_fft, hop_length=hop_length)
         S_db = librosa.amplitude_to_db(np.abs(S), ref=np.max)
 
-        # Time and frequency axes
         freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
         times = librosa.frames_to_time(
             np.arange(S_db.shape[1]),
@@ -200,73 +256,39 @@ class SpectrogramCanvas(FigureCanvas):
             freqs = freqs[:max_idx]
             S_db = S_db[:max_idx, :]
 
-    
-
-        # Apply dark theme
-        self.figure.patch.set_facecolor("#252525")      # dark gray background
-        self.ax.set_facecolor("#252525")               # same background for axes
-
-        # Remove spines (borders)
-        for spine in self.ax.spines.values():
-            spine.set_visible(False)
-
-        # Remove default title
-        self.ax.set_title("")
-
-        # Customize axes colors
-        self.ax.tick_params(
-            colors="white",
-            which="both",
-            direction="out",
-            length=3,
-            width=1,
-            labelsize=8
-        )
-
-        # Low-profile grid for readability (optional)
-        self.ax.grid(False)
-
-        # Plot spectrogram
+        # --- Plot spectrogram image ---
         img = self.ax.imshow(
             S_db,
             origin="lower",
             aspect="auto",
             extent=[times.min(), times.max(), freqs.min(), freqs.max()],
             cmap=settings.cmap,
-            interpolation="nearest",
+            interpolation="bilinear",  # slightly smoothed look
         )
 
-        # Labels (small, clean, anchored)
-        self.ax.set_xlabel("Time (s)", color="white", fontsize=9, labelpad=4)
-        self.ax.set_ylabel("Frequency (Hz)", color="white", fontsize=9, labelpad=4)
+        # Anchor axes to the left so we use as much width as possible
+        self.ax.set_anchor("W")
+        self.ax.margins(0)
 
-        # Tight axes without extra padding
-        self.ax.set_anchor("W")      # force anchor to West (left) to maximize width
-        self.ax.margins(0)           # no auto margins
-        
-        # Make ticks more subtle
-        self.ax.xaxis.set_tick_params(color="white")
-        self.ax.yaxis.set_tick_params(color="white")
+        # Remove axis labels for a clean DAW look
+        self.ax.set_xlabel("")
+        self.ax.set_ylabel("")
 
-        # Remove colorbar or theme it
-        cbar = self.figure.colorbar(img, ax=self.ax, format="%+2.0f dB", pad=0.02)
+        # --- Colorbar tightly attached using axes_grid1 ---
+        divider = make_axes_locatable(self.ax)
+        # Thin, compact colorbar on the right, very close to the spectrogram
+        cax = divider.append_axes("right", size="2%", pad=0.05)
+
+        cbar = self.figure.colorbar(img, cax=cax, format="%+2.0f dB")
         cbar.outline.set_visible(False)
-        cbar.ax.tick_params(color="white", labelsize=7)
-        cbar.ax.yaxis.set_tick_params(color="white")
-        cbar.ax.yaxis.set_tick_params(labelcolor="white")
-        cbar.ax.set_facecolor("#252525")
-        cbar.ax.set_position([
-            0.935,      # X position of colorbar in figure coords
-            0.08,       # Y bottom
-            0.015,      # width
-            0.88        # height
-        ])
+        cbar.ax.tick_params(color="white", labelcolor="white", labelsize=7)
+        cbar.ax.set_facecolor("#232323")
 
         # Save full limits for zoom reset
         self._full_xlim = (times.min(), times.max())
         self._full_ylim = (freqs.min(), freqs.max())
 
-        # Recreate RectangleSelector on the new axis
+        # Recreate RectangleSelector on the new axis (because we recreated self.ax)
         self.selector = RectangleSelector(
             self.ax,
             self.on_select_rectangle,
@@ -279,19 +301,19 @@ class SpectrogramCanvas(FigureCanvas):
             drag_from_anywhere=True,
         )
 
-        self.tight_layout()
-
-        # Remove margins around the plot area
+        # Adjust subplot margins: enough for x/y ticks, still very clean
         self.figure.subplots_adjust(
-            left=0.03,   # distance from left border (0 = no space)
-            right=0.995,  # leave space for colorbar
-            top=0.98,    # near top border
-            bottom=0.06  # near bottom border
+            left=0.07,     # enough space for Y tick labels
+            right=0.945,   # space reserved for right-side colorbar
+            top=0.985,     # almost no top margin
+            bottom=0.07,   # space for X tick labels
         )
+
         self.draw()
 
-    # ---------- Zoom handling ----------
-
+    # ------------------------------------------------------------------
+    # Zoom handling
+    # ------------------------------------------------------------------
     def on_select_rectangle(self, eclick, erelease):
         """
         Callback called when the user finishes drawing the rectangle.
@@ -322,19 +344,18 @@ class SpectrogramCanvas(FigureCanvas):
 
     def mousePressEvent(self, event):
         """
-        Reimplemented to allow right-click zoom reset on the Qt side.
-        Left-click is handled by matplotlib events.
+        Allow right-click zoom reset on the Qt side.
+        Left-click and drag are handled by Matplotlib events.
         """
         if event.button() == Qt.RightButton:
             self.reset_zoom()
         super().mousePressEvent(event)
 
-    # ---------- Click vs drag detection (for playhead) ----------
-
+    # ------------------------------------------------------------------
+    # Click vs drag detection (for playhead vs zoom)
+    # ------------------------------------------------------------------
     def _on_button_press(self, event):
-        """
-        Store the press event to later decide if it was a click or a drag.
-        """
+        """Store the press event to later decide if it was a click or a drag."""
         if event.button != 1:
             return
         if event.inaxes != self.ax:
@@ -345,7 +366,7 @@ class SpectrogramCanvas(FigureCanvas):
         """
         On release, if the mouse did not move much, treat this as a click
         and emit time_clicked. If there was a real drag, we consider it a
-        zoom rectangle instead (handled by RectangleSelector).
+        zoom rectangle (handled by RectangleSelector).
         """
         if event.button != 1:
             return
@@ -354,46 +375,39 @@ class SpectrogramCanvas(FigureCanvas):
         if self._press_event is None:
             return
 
-        # Compute distance in screen pixels between press and release
         dx = event.x - self._press_event.x
         dy = event.y - self._press_event.y
         dist2 = dx * dx + dy * dy
 
-        # Threshold in pixels: small movement = click, big movement = drag
         click_threshold = 5  # pixels
         if dist2 <= click_threshold * click_threshold:
-            # This is a click -> move playhead
             if event.xdata is not None:
                 self.time_clicked.emit(float(event.xdata))
 
-        # Reset stored press event
         self._press_event = None
 
-    # ---------- Playhead (red line) ----------
-
+    # ------------------------------------------------------------------
+    # Playhead line
+    # ------------------------------------------------------------------
     def update_playhead(self, time_sec: float):
         """
         Draw or move the vertical red playhead line at the given time (seconds).
+        This is intended to be called frequently (e.g. from a QTimer).
         """
         if self.ax is None:
             return
 
         if self.playhead_line is None:
-            # Create a new vertical line
-            self.playhead_line = self.ax.axvline(time_sec, color="red", linewidth=1.5)
+            self.playhead_line = self.ax.axvline(
+                time_sec,
+                color="#ff4444",
+                linewidth=2.0,
+            )
         else:
-            # Move existing vertical line
             self.playhead_line.set_xdata([time_sec, time_sec])
 
+        # Light redraw, does not recompute the spectrogram
         self.draw_idle()
-
-    def tight_layout(self):
-        """Safe wrapper around figure.tight_layout()."""
-        try:
-            self.figure.tight_layout()
-        except Exception:
-            pass
-
 
 class AudioSpectrogramPlayer(QMainWindow):
     """
@@ -707,9 +721,6 @@ class AudioSpectrogramPlayer(QMainWindow):
             f"Current file: {os.path.basename(path)}",
             f"Sample rate: {sr} Hz  |  Duration: {duration:.2f} s  |  Samples: {num_samples}",
         ]
-
-        if db_min is not None and db_max is not None:
-            info_lines.append(f"Spectrogram dB range: min={db_min:.1f} dB  |  max={db_max:.1f} dB")
 
         self.current_file_label.setText("\n".join(info_lines))
 
