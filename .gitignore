@@ -229,3 +229,5 @@ checkpoints/
 *.ckpt
 *logs/
 *.mp3
+
+data/
