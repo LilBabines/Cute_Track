@@ -11,6 +11,7 @@ This app lets you:
     - Open a settings dialog to change spectrogram parameters.
 """
 
+import csv
 from dataclasses import dataclass
 from typing import List, Optional
 import sys
@@ -31,6 +32,7 @@ from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.widgets import RectangleSelector
+import matplotlib.patches as patches
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 
@@ -41,6 +43,15 @@ class SpectrogramSettings:
     hop_ms: float = 10.0         # hop duration in milliseconds (time resolution)
     cmap: str = "magma"
     max_freq: Optional[int] = None  # Hz, None means full range
+
+
+@dataclass
+class Annotation:
+    file: str
+    start: float
+    end: float
+    label: str
+    description: str
 
 
 class SpectrogramSettingsDialog(QDialog):
@@ -125,6 +136,8 @@ class SpectrogramCanvas(FigureCanvas):
 
     # Emitted when the user left-clicks (without dragging) on the spectrogram (time in seconds)
     time_clicked = Signal(float)
+    # Emitted when the user clicks on an annotation rectangle (passes Annotation object)
+    annotation_clicked = Signal(object)
 
     def __init__(self, parent=None):
         # Create figure and a single axes
@@ -183,6 +196,10 @@ class SpectrogramCanvas(FigureCanvas):
         self._press_event = None
         self._press_cid = self.mpl_connect("button_press_event", self._on_button_press)
         self._release_cid = self.mpl_connect("button_release_event", self._on_button_release)
+        
+        self._pick_cid = self.mpl_connect("pick_event", self._on_pick)
+
+        self.selected_annotation = None
 
     # ------------------------------------------------------------------
     # Spectrogram drawing
@@ -195,6 +212,8 @@ class SpectrogramCanvas(FigureCanvas):
         # Clear figure and recreate axes to remove old colorbars cleanly
         self.figure.clear()
         self.ax = self.figure.add_subplot(111)
+        self.annotation_patches = []
+        self.annotations = []
 
         # Reapply dark theme and borderless style
         self.figure.patch.set_facecolor("#232323")
@@ -342,6 +361,18 @@ class SpectrogramCanvas(FigureCanvas):
             self.ax.set_ylim(*self._full_ylim)
             self.draw()
 
+    def _on_pick(self, event):
+        artist = event.artist
+
+        # Find which annotation was clicked
+        for ann, rect in zip(self.annotations, self.annotation_patches):
+            if artist is rect:
+                self.selected_annotation = ann   # mark selection
+                self.annotation_clicked.emit(ann)
+                # redraw with updated colors
+                self.draw_annotations(self.annotations)
+                return
+
     def mousePressEvent(self, event):
         """
         Allow right-click zoom reset on the Qt side.
@@ -409,6 +440,43 @@ class SpectrogramCanvas(FigureCanvas):
         # Light redraw, does not recompute the spectrogram
         self.draw_idle()
 
+    def clear_annotations(self):
+        """Remove existing annotation rectangles from the axes."""        
+        for p in getattr(self, "annotation_patches", []):
+            p.remove()
+        self.annotation_patches = []
+        self.annotations = []
+        self.draw_idle()
+
+    def draw_annotations(self, annotations):
+        self.annotations = annotations
+        self.annotation_patches = []
+
+        for ann in annotations:
+            # Determine color depending on selection
+            if ann is self.selected_annotation:
+                edge = "#00ff44"      # green
+                fill = "#00ff4433"    # green transparent
+            else:
+                edge = "#0099ff"      # blue
+                fill = "#0099ff33"    # blue transparent
+
+            rect = patches.Rectangle(
+                (ann.start, self._full_ylim[0]),
+                ann.end - ann.start,
+                self._full_ylim[1] - self._full_ylim[0],
+                linewidth=1.5,
+                edgecolor=edge,
+                facecolor=fill,
+                picker=True,
+                zorder=50,
+            )
+
+            self.ax.add_patch(rect)
+            self.annotation_patches.append(rect)
+
+        self.draw_idle()
+
 class AudioSpectrogramPlayer(QMainWindow):
     """
     Main window of the application.
@@ -443,6 +511,13 @@ class AudioSpectrogramPlayer(QMainWindow):
 
         self._playhead_time: float = 0.0
 
+
+        self.annotations = []            # all annotations from all files
+        self.annotations_by_file = {}    # mapping: file → list[Annotation]
+        self.current_annotations = []    # annotations displayed for current audio
+        self.current_annotation_patches = []  # rectangles drawn on canvas
+
+
     def _build_ui(self):
         """Create the central widgets and layout using horizontal and vertical splitters."""
         central = QWidget(self)
@@ -455,43 +530,69 @@ class AudioSpectrogramPlayer(QMainWindow):
         main_splitter.setChildrenCollapsible(False)
         main_layout.addWidget(main_splitter)
 
-        # ---------- Left side: file list + playback controls ----------
-        left_widget = QWidget(main_splitter)
-        left_layout = QVBoxLayout(left_widget)
+        # ---------- Left side container ----------
+        left_container = QWidget(main_splitter)     # THIS replaces left_widget
+        left_container_layout = QVBoxLayout(left_container)
 
-        # Top row: label + dropdown button
+        # Header row with "Select file" button
         header_layout = QHBoxLayout()
-        # header_label = QLabel("Audio files:", left_widget)
-        # header_layout.addWidget(header_label)
-
-        # Dropdown button with hierarchical menu for file selection
-        self.file_select_button = QToolButton(left_widget)
+        self.file_select_button = QToolButton(left_container)
         self.file_select_button.setText("Select file")
         self.file_select_button.setPopupMode(QToolButton.InstantPopup)
         self.file_select_menu = QMenu(self.file_select_button)
         self.file_select_button.setMenu(self.file_select_menu)
         header_layout.addWidget(self.file_select_button)
-
         header_layout.addStretch()
-        left_layout.addLayout(header_layout)
+        left_container_layout.addLayout(header_layout)
 
-        # File list widget
-        self.file_list = QListWidget(left_widget)
+        # ---------- Split the left panel vertically ----------
+        left_splitter = QSplitter(Qt.Vertical, left_container)
+        left_splitter.setChildrenCollapsible(False)
+        left_container_layout.addWidget(left_splitter)
+
+        #
+        # Upper part: file list
+        #
+        files_widget = QWidget(left_splitter)
+        files_layout = QVBoxLayout(files_widget)
+
+        files_header = QLabel("Audio files:")
+        files_layout.addWidget(files_header)
+
+        self.file_list = QListWidget(files_widget)
         self.file_list.currentRowChanged.connect(self.on_file_selected)
-        left_layout.addWidget(self.file_list)
+        files_layout.addWidget(self.file_list)
 
-        # Playback controls
+        #
+        # Lower part: annotation list
+        #
+        annotations_widget = QWidget(left_splitter)
+        annotations_layout = QVBoxLayout(annotations_widget)
+
+        ann_header = QLabel("Annotations:")
+        annotations_layout.addWidget(ann_header)
+
+        self.annotation_list = QListWidget(annotations_widget)
+        self.annotation_list.itemClicked.connect(self.on_annotation_item_clicked)
+        annotations_layout.addWidget(self.annotation_list)
+
+        left_splitter.addWidget(files_widget)
+        left_splitter.addWidget(annotations_widget)
+        left_splitter.setSizes([500, 300])
+
+        # ---------- Playback controls BELOW the splitter ----------
         controls_layout = QHBoxLayout()
-        self.play_button = QPushButton("Play", left_widget)
-        self.pause_button = QPushButton("Pause", left_widget)
+        self.play_button = QPushButton("Play", left_container)
+        self.pause_button = QPushButton("Pause", left_container)
         self.play_button.clicked.connect(self.on_play_clicked)
         self.pause_button.clicked.connect(self.on_pause_clicked)
         controls_layout.addWidget(self.play_button)
         controls_layout.addWidget(self.pause_button)
-        left_layout.addLayout(controls_layout)
 
-        main_splitter.addWidget(left_widget)
+        left_container_layout.addLayout(controls_layout)
 
+        # Add the LEFT CONTAINER to the main splitter
+        main_splitter.addWidget(left_container)
         # ---------- Right side: vertical splitter (canvas + info label) ----------
         right_splitter = QSplitter(Qt.Vertical, main_splitter)
         right_splitter.setChildrenCollapsible(False)
@@ -503,6 +604,7 @@ class AudioSpectrogramPlayer(QMainWindow):
         canvas_layout.addWidget(self.canvas)
 
         self.canvas.time_clicked.connect(self.on_canvas_time_clicked)
+        self.canvas.annotation_clicked.connect(self.on_annotation_clicked)
 
         info_container = QWidget(right_splitter)
         info_layout = QVBoxLayout(info_container)
@@ -543,12 +645,56 @@ class AudioSpectrogramPlayer(QMainWindow):
         file_menu = menubar.addMenu("File")
         load_action = file_menu.addAction("Load audio")
         load_action.triggered.connect(self.on_load_audio_folder)
+        load_ann = file_menu.addAction("Load Annotation")
+        load_ann.triggered.connect(self.on_load_annotations)
 
         # Settings menu
         settings_menu = menubar.addMenu("Settings")
         spectro_action = settings_menu.addAction("Spectrogram Settings")
         spectro_action.triggered.connect(self.on_open_spectrogram_settings)
 
+    def on_load_annotations(self):
+        """
+        Load annotation CSV. Each row:
+            file,start,end,class,description
+        """
+        csv_path, _ = QFileDialog.getOpenFileName(self, "Load annotation CSV", "", "CSV (*.csv)")
+        if not csv_path:
+            return
+
+        self.annotations = []
+        self.annotations_by_file.clear()
+
+        try:
+            with open(csv_path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    ann = Annotation(
+                        file=row["file"],
+                        start=float(row["start"]),
+                        end=float(row["end"]),
+                        label=row["class"],
+                        description=row["description"],
+                    )
+                    self.annotations.append(ann)
+
+                    # group by file
+                    self.annotations_by_file.setdefault(ann.file, []).append(ann)
+
+                # Populate annotation list (lower panel)
+                self.annotation_list.clear()
+
+                for ann in self.annotations:
+                    text = f"{ann.file} | {ann.start:.2f}s - {ann.end:.2f}s | {ann.label}"
+                    self.annotation_list.addItem(text)
+
+
+        except Exception as e:
+            QMessageBox.critical(self, "CSV Error", f"Failed to load CSV:\n{e}")
+            return
+
+        QMessageBox.information(self, "Annotation loaded", f"Loaded {len(self.annotations)} annotations.")
+        
 
     def build_file_selection_menu(self, base_folder: str):
         """
@@ -712,9 +858,18 @@ class AudioSpectrogramPlayer(QMainWindow):
         # Compute spectrogram (this also updates db_min/db_max in canvas)
         self.canvas.plot_spectrogram(audio, sr, self.spectrogram_settings)
 
-        # Retrieve dB values from canvas if available
-        db_min = getattr(self.canvas, "db_min", None)
-        db_max = getattr(self.canvas, "db_max", None)
+
+        # Clear previous annotation patches
+        self.canvas.clear_annotations()
+
+        # Retrieve annotations for this file
+        basename = os.path.basename(path)
+        self.current_annotations = self.annotations_by_file.get(basename, [])
+
+        # Draw them
+        self.canvas.draw_annotations(self.current_annotations)
+
+        self.canvas.selected_annotation = None
 
         # Build info text
         info_lines = [
@@ -781,6 +936,61 @@ class AudioSpectrogramPlayer(QMainWindow):
 
         self._playhead_time = t_sec
         self.update_playhead_visual()
+
+    def on_annotation_clicked(self, ann: Annotation):
+        """
+        Display annotation info in the bottom panel instead of file info.
+        """
+        text = (
+            f"Annotation\n"
+            f"Class: {ann.label}\n"
+            f"Start: {ann.start:.2f} s\n"
+            f"End: {ann.end:.2f} s\n"
+            f"Description: {ann.description}"
+        )
+        self.current_file_label.setText(text)
+
+    def on_annotation_item_clicked(self, item):
+        """
+        When clicking on an annotation in the lower-left list:
+        - Find the corresponding annotation
+        - Load its audio file
+        - Select the file in the file list
+        - Update annotation info in bottom panel
+        """
+        text = item.text()
+
+        # retrieve the annotation object
+        for ann in self.annotations:
+            summary = f"{ann.file} | {ann.start:.2f}s - {ann.end:.2f}s | {ann.label}"
+            if summary == text:
+                # Found annotation
+                # Step 1: locate audio file
+                target_file = ann.file
+
+                # Find full path in audio_files list
+                for i, path in enumerate(self.audio_files):
+                    if os.path.basename(path) == target_file:
+                        # Select this file
+                        self.file_list.setCurrentRow(i)
+                        self.canvas.selected_annotation = ann
+                        self.canvas.draw_annotations(self.current_annotations)
+
+                        # Move playhead to annotation start
+                        self._playhead_time = ann.start
+                        self.update_playhead_visual()
+
+                        # Print annotation info on bottom panel
+                        info = (
+                            f"Annotation\n"
+                            f"Class: {ann.label}\n"
+                            f"Start: {ann.start:.2f} s\n"
+                            f"End:   {ann.end:.2f} s\n"
+                            f"Description: {ann.description}"
+                        )
+                        self.current_file_label.setText(info)
+
+                        return
 
 
     def update_playhead_visual(self):
