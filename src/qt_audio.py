@@ -24,25 +24,28 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QListWidget, QPushButton, QFileDialog, QMessageBox, QDialog,
     QFormLayout, QDialogButtonBox, QSpinBox, QComboBox, QLabel, 
-    QProgressDialog, QSplitter, QToolButton, QMenu, QDoubleSpinBox
+    QProgressDialog, QSplitter, QToolButton, QMenu, QDoubleSpinBox,
 )
-from PySide6.QtCore import Qt, QUrl, Signal
+from PySide6 import QtGui
+from PySide6.QtCore import Qt, QUrl, Signal, QRectF, QTimer
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
-from matplotlib.widgets import RectangleSelector
-import matplotlib.patches as patches
-from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+import pyqtgraph as pg
+import matplotlib.cm as cm  # reuse matplotlib colormaps for LUT
+
+
 
 
 @dataclass
 class SpectrogramSettings:
     """Container for spectrogram parameters."""
-    n_fft: int = 2048
-    hop_ms: float = 10.0         # hop duration in milliseconds (time resolution)
-    cmap: str = "magma"
-    max_freq: Optional[int] = None  # Hz, None means full range
+    n_fft: int = 256
+    win_length: int = 128
+    hop_ms: float = 2.0         # hop duration in milliseconds (time resolution)
+    cmap: str = "turbo"
+    max_freq: Optional[int] = 20000  # Hz, None means full range
+    max_cache_mb: int = 256        # max memory for full audio cache
 
 
 @dataclass
@@ -65,9 +68,11 @@ class SpectrogramSettingsDialog(QDialog):
         # Copy initial settings so we do not modify them until the user presses OK
         self._settings = SpectrogramSettings(
             n_fft=settings.n_fft,
+            win_length=settings.win_length,
             hop_ms=settings.hop_ms,
             cmap=settings.cmap,
             max_freq=settings.max_freq,
+            max_cache_mb=settings.max_cache_mb,
         )
         self._build_ui()
 
@@ -83,6 +88,13 @@ class SpectrogramSettingsDialog(QDialog):
         self.n_fft_spin.setValue(self._settings.n_fft)
         form.addRow("FFT size (n_fft):", self.n_fft_spin)
 
+        # Window length spin box
+        self.win_length_spin = QSpinBox()
+        self.win_length_spin.setRange(128, 16384)
+        self.win_length_spin.setSingleStep(128)
+        self.win_length_spin.setValue(self._settings.win_length)
+        form.addRow("Window length (win_length):", self.win_length_spin)
+
         # Hop duration in milliseconds (time resolution)
         self.hop_ms_spin = QDoubleSpinBox()
         self.hop_ms_spin.setRange(1.0, 500.0)      # 1 ms to 500 ms
@@ -94,17 +106,23 @@ class SpectrogramSettingsDialog(QDialog):
         # Max frequency spin box
         self.max_freq_spin = QSpinBox()
         self.max_freq_spin.setRange(0, 48000)
-        self.max_freq_spin.setValue(self._settings.max_freq or 0)
-        self.max_freq_spin.setSpecialValueText("0 (full range)")
+        self.max_freq_spin.setValue(20000)
         form.addRow("Max frequency (Hz):", self.max_freq_spin)
 
         # Colormap combo box
         self.cmap_combo = QComboBox()
-        cmaps = ["magma", "viridis", "plasma", "inferno", "cividis"]
+        cmaps = ["magma","turbo", "viridis", "plasma", "inferno", "cividis"]
         self.cmap_combo.addItems(cmaps)
         if self._settings.cmap in cmaps:
             self.cmap_combo.setCurrentText(self._settings.cmap)
         form.addRow("Colormap:", self.cmap_combo)
+
+        # Max cache size in MB
+        self.cache_spin = QSpinBox()
+        self.cache_spin.setRange(32, 4096)
+        self.cache_spin.setSingleStep(32)
+        self.cache_spin.setValue(self._settings.max_cache_mb)
+        form.addRow("Max cache size (MB):", self.cache_spin)
 
         layout.addLayout(form)
 
@@ -117,152 +135,157 @@ class SpectrogramSettingsDialog(QDialog):
     def get_settings(self) -> SpectrogramSettings:
         """Return updated settings based on the dialog inputs."""
         self._settings.n_fft = int(self.n_fft_spin.value())
+        self._settings.win_length = int(self.win_length_spin.value())
         self._settings.hop_ms = float(self.hop_ms_spin.value())
         maxf = int(self.max_freq_spin.value())
         self._settings.max_freq = maxf if maxf > 0 else None
         self._settings.cmap = self.cmap_combo.currentText()
+        self._settings.max_cache_mb = int(self.cache_spin.value())
         return self._settings
 
-    
-class SpectrogramCanvas(FigureCanvas):
+class SpectroViewBox(pg.ViewBox):
     """
-    Dark, borderless spectrogram canvas with:
-        - DAW-style look (no frame, no title, minimal or no ticks)
-        - zoom rectangle (left-drag)
-        - right-click zoom reset
-        - playhead (vertical red line) updated via update_playhead()
-        - click vs drag detection (click moves playhead, drag zooms)
+    Custom ViewBox:
+        - Left drag: built-in rect-zoom (RectMode)
+        - Left click (no drag): emit time click
+        - Right click: reset zoom
+    """
+    sigTimeClicked = Signal(float)   # x (seconds)
+    sigZoomReset = Signal()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, enableMenu=False, **kwargs)
+        # Use rectangle zoom, not panning
+        self.setMouseMode(self.RectMode)
+
+    def mouseClickEvent(self, ev):
+        if ev.button() == Qt.LeftButton:
+            pos = self.mapToView(ev.pos())
+            self.sigTimeClicked.emit(float(pos.x()))
+            ev.accept()
+        elif ev.button() == Qt.RightButton:
+            # Reset zoom
+            self.autoRange()
+            self.sigZoomReset.emit()
+            ev.accept()
+        else:
+            super().mouseClickEvent(ev)
+
+    # We keep default RectMode behaviour for drags -> rectangle zoom
+    # so we don't override mouseDragEvent.
+
+class SpectrogramCanvas(QWidget):
+    """
+    High-performance spectrogram canvas using PyQtGraph.
+
+    - Dark DAW-style look (no frame, minimal axes)
+    - Very fast image rendering (ImageItem)
+    - Annotations as LinearRegionItem (blue / green when selected)
+    - Playhead as InfiniteLine (updated frequently from a QTimer or positionChanged)
+    - Left-click on spectrogram -> move playhead
+    - Left-click on annotated zone -> select annotation + emit annotation_clicked
+    - Right-click -> reset zoom
     """
 
-    # Emitted when the user left-clicks (without dragging) on the spectrogram (time in seconds)
-    time_clicked = Signal(float)
-    # Emitted when the user clicks on an annotation rectangle (passes Annotation object)
-    annotation_clicked = Signal(object)
+    time_clicked = Signal(float)       # time in seconds
+    annotation_clicked = Signal(object)  # emits Annotation object
 
     def __init__(self, parent=None):
-        # Create figure and a single axes
-        fig = Figure(figsize=(6, 4))
-        self.ax = fig.add_subplot(111)
+        super().__init__(parent)
 
-        super().__init__(fig)
-        self.setParent(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-        # Dark theme for the whole figure
-        self.figure.patch.set_facecolor("#232323")
-        self.ax.set_facecolor("#232323")
+        # Use our custom ViewBox
+        self.vb = SpectroViewBox()
+        self.plot = pg.PlotWidget(parent=self, viewBox=self.vb)
+        layout.addWidget(self.plot)
 
-        # Remove all spines (no visible frame)
-        for spine in self.ax.spines.values():
-            spine.set_visible(False)
+        # Dark background
+        self.plot.setBackground("#232323")
+        # self.plot.invertY(True)
 
-        # No title
-        self.ax.set_title("")
+        # Axes styling
+        for name in ("bottom", "left"):
+            axis = self.plot.getAxis(name)
+            axis.setPen(pg.mkPen("#ffffff", width=1))
+            axis.setTextPen(pg.mkPen("#ffffff"))
 
-        # Optional: minimal ticks style (you can comment these out to remove ticks entirely)
-        self.ax.tick_params(
-            colors="white",
-            which="both",
-            direction="out",
-            length=2,
-            width=0.8,
-            labelsize=7,
+            # Only tickLength is valid
+            axis.setStyle(tickLength=3)
+
+            # Tick font
+            font = QtGui.QFont("Sans", 8)
+            axis.setTickFont(font)
+
+        # Remove default title, grid, etc.
+        self.plot.showGrid(x=False, y=False)
+        self.plot.setMouseEnabled(x=False, y=False)  # delete pan/zoom behavior
+
+        # Connect our custom viewbox signals
+        self.vb.sigTimeClicked.connect(self._on_time_clicked_from_viewbox)
+        self.vb.sigZoomReset.connect(self._on_zoom_reset)
+
+        # Image item for the spectrogram
+        self.img_item = pg.ImageItem()
+        self.plot.addItem(self.img_item)
+
+        # Playhead line
+        self.playhead_line = pg.InfiniteLine(
+            angle=90,
+            pos=0.0,
+            pen=pg.mkPen("#ff4444", width=2),
+            movable=False,
         )
+        self.plot.addItem(self.playhead_line)
 
-        # If you prefer NO tick labels at all (pure borderless visual), uncomment:
-        # self.ax.set_xticklabels([])
-        # self.ax.set_yticklabels([])
-
-        # Full extents for zoom reset
-        self._full_xlim = None
-        self._full_ylim = None
-
-        # Playhead (vertical red line)
-        self.playhead_line = None
-
-        # Rectangle selector for zoom (left mouse button)
-        self.selector = RectangleSelector(
-            self.ax,
-            self.on_select_rectangle,
-            useblit=True,
-            button=[1],  # left mouse button
-            minspanx=0.01,
-            minspany=0.01,
-            spancoords="data",
-            interactive=False,
-            drag_from_anywhere=True,
-        )
-
-        # Variables to detect click vs drag
-        self._press_event = None
-        self._press_cid = self.mpl_connect("button_press_event", self._on_button_press)
-        self._release_cid = self.mpl_connect("button_release_event", self._on_button_release)
-        
-        self._pick_cid = self.mpl_connect("pick_event", self._on_pick)
-
+        # Annotation handling
+        self.annotations = []              # list[Annotation]
+        self.annotation_regions = []       # list[pg.LinearRegionItem]
         self.selected_annotation = None
+
+        # Data extents for checks
+        self.times = None
+        self.freqs = None
+
+        # # Mouse click handling through the scene
+        # self.plot.scene().sigMouseClicked.connect(self._on_mouse_clicked)
+
+        # self.plot.invertY(True)
 
     # ------------------------------------------------------------------
     # Spectrogram drawing
     # ------------------------------------------------------------------
     def plot_spectrogram(self, audio: np.ndarray, sr: int, settings):
         """
-        Compute and draw the spectrogram of the given audio signal
-        in a DAW-style, borderless, dark canvas.
+        Compute and display the spectrogram of the given audio signal.
         """
-        # Clear figure and recreate axes to remove old colorbars cleanly
-        self.figure.clear()
-        self.ax = self.figure.add_subplot(111)
-        self.annotation_patches = []
-        self.annotations = []
-
-        # Reapply dark theme and borderless style
-        self.figure.patch.set_facecolor("#232323")
-        self.ax.set_facecolor("#232323")
-
-        for spine in self.ax.spines.values():
-            spine.set_visible(False)
-
-        self.ax.set_title("")
-
-        self.ax.tick_params(
-            colors="white",
-            which="both",
-            direction="out",
-            length=2,
-            width=0.8,
-            labelsize=7,
-        )
-
-        # If you want completely borderless (no tick labels), uncomment:
-        # self.ax.set_xticklabels([])
-        # self.ax.set_yticklabels([])
-
-        self.playhead_line = None  # will be recreated for new spectrogram
+        # Reset any previous image / data references
+        self.times = None
+        self.freqs = None
 
         if audio is None or len(audio) == 0:
-            self.ax.text(
-                0.5,
-                0.5,
-                "No audio loaded",
-                color="white",
-                ha="center",
-                va="center",
-                transform=self.ax.transAxes,
-            )
-            self.draw()
+            # Clear and show message
+            self.img_item.clear()
+            self.plot.clear()
+            self.plot.addItem(self.playhead_line)
+            txt = pg.TextItem("No audio loaded", color="w", anchor=(0.5, 0.5))
+            txt.setPos(0, 0)
+            self.plot.addItem(txt)
             return
 
         # --- Compute STFT using librosa ---
-        # Window size in samples
         n_fft = settings.n_fft
-
-        # Time step (hop) in samples, computed from hop_ms so resolution is independent of file length
+        win_length = settings.win_length
         hop_length = max(1, int(sr * (settings.hop_ms / 1000.0)))
+        print(f"Computing spectrogram: n_fft={n_fft}, win_length={win_length}, hop_length={hop_length}")
 
-        S = librosa.stft(audio, n_fft=n_fft, hop_length=hop_length)
+        S = librosa.stft(audio, n_fft=n_fft, win_length = win_length, hop_length=hop_length) #
         S_db = librosa.amplitude_to_db(np.abs(S), ref=np.max)
-
+        print(f"Spectrogram shape: {S_db.shape}")
+        # Build time and frequency axes
         freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+
         times = librosa.frames_to_time(
             np.arange(S_db.shape[1]),
             sr=sr,
@@ -275,207 +298,208 @@ class SpectrogramCanvas(FigureCanvas):
             freqs = freqs[:max_idx]
             S_db = S_db[:max_idx, :]
 
-        # --- Plot spectrogram image ---
-        img = self.ax.imshow(
+        self.times = times
+        self.freqs = freqs
+
+        # Use a matplotlib colormap as a LUT for pyqtgraph
+        # S_db: shape (freqs, times)
+        cmap = cm.get_cmap(settings.cmap)
+        lut = (cmap(np.linspace(0.0, 1.0, 256)) * 255).astype(np.uint8)
+
+        # We want time on X, frequency on Y.
+        # pyqtgraph expects data array as (rows, cols) = (Y, X) -> already (freq, time),
+        # so we can use it directly.
+        S_db = S_db.astype(np.float32)
+        db_min = float(S_db.min())
+        db_max = float(S_db.max())
+
+        self.img_item.setImage(
             S_db,
-            origin="lower",
-            aspect="auto",
-            extent=[times.min(), times.max(), freqs.min(), freqs.max()],
-            cmap=settings.cmap,
-            interpolation="bilinear",  # slightly smoothed look
+            lut=lut,
+            levels=(db_min, db_max),
+            autoLevels=False,
+            axisOrder="row-major",
         )
 
-        # Anchor axes to the left so we use as much width as possible
-        self.ax.set_anchor("W")
-        self.ax.margins(0)
-
-        # Remove axis labels for a clean DAW look
-        self.ax.set_xlabel("")
-        self.ax.set_ylabel("")
-
-        # --- Colorbar tightly attached using axes_grid1 ---
-        divider = make_axes_locatable(self.ax)
-        # Thin, compact colorbar on the right, very close to the spectrogram
-        cax = divider.append_axes("right", size="2%", pad=0.05)
-
-        cbar = self.figure.colorbar(img, cax=cax, format="%+2.0f dB")
-        cbar.outline.set_visible(False)
-        cbar.ax.tick_params(color="white", labelcolor="white", labelsize=7)
-        cbar.ax.set_facecolor("#232323")
-
-        # Save full limits for zoom reset
-        self._full_xlim = (times.min(), times.max())
-        self._full_ylim = (freqs.min(), freqs.max())
-
-        # Recreate RectangleSelector on the new axis (because we recreated self.ax)
-        self.selector = RectangleSelector(
-            self.ax,
-            self.on_select_rectangle,
-            useblit=True,
-            button=[1],
-            minspanx=0.01,
-            minspany=0.01,
-            spancoords="data",
-            interactive=False,
-            drag_from_anywhere=True,
+        # Map image coordinates to real time/frequency
+        t_min, t_max = times[0], times[-1]
+        f_min, f_max = freqs[0], freqs[-1]
+        rect = QRectF(
+            t_min,
+            f_min,
+            (t_max - t_min),
+            (f_max - f_min)
         )
+        self.img_item.setRect(rect)
 
-        # Adjust subplot margins: enough for x/y ticks, still very clean
-        self.figure.subplots_adjust(
-            left=0.07,     # enough space for Y tick labels
-            right=0.945,   # space reserved for right-side colorbar
-            top=0.985,     # almost no top margin
-            bottom=0.07,   # space for X tick labels
-        )
+        # Reset view to full range
+        self.plot.setXRange(t_min, t_max, padding=0.0)
+        self.plot.setYRange(f_min, f_max, padding=0.0)
+        self.plot.enableAutoRange(x=False, y=False)
 
-        self.draw()
-
-    # ------------------------------------------------------------------
-    # Zoom handling
-    # ------------------------------------------------------------------
-    def on_select_rectangle(self, eclick, erelease):
-        """
-        Callback called when the user finishes drawing the rectangle.
-        It zooms the axes to the selected region.
-        """
-        x1, y1 = eclick.xdata, eclick.ydata
-        x2, y2 = erelease.xdata, erelease.ydata
-
-        if None in (x1, y1, x2, y2):
-            return
-
-        xmin, xmax = sorted([x1, x2])
-        ymin, ymax = sorted([y1, y2])
-
-        if abs(xmax - xmin) < 1e-6 or abs(ymax - ymin) < 1e-6:
-            return
-
-        self.ax.set_xlim(xmin, xmax)
-        self.ax.set_ylim(ymin, ymax)
-        self.draw()
-
-    def reset_zoom(self):
-        """Reset axes limits to the full spectrogram view."""
-        if self._full_xlim is not None and self._full_ylim is not None:
-            self.ax.set_xlim(*self._full_xlim)
-            self.ax.set_ylim(*self._full_ylim)
-            self.draw()
-
-    def _on_pick(self, event):
-        artist = event.artist
-
-        # Find which annotation was clicked
-        for ann, rect in zip(self.annotations, self.annotation_patches):
-            if artist is rect:
-                self.selected_annotation = ann   # mark selection
-                self.annotation_clicked.emit(ann)
-                # redraw with updated colors
-                self.draw_annotations(self.annotations)
-                return
-
-    def mousePressEvent(self, event):
-        """
-        Allow right-click zoom reset on the Qt side.
-        Left-click and drag are handled by Matplotlib events.
-        """
-        if event.button() == Qt.RightButton:
-            self.reset_zoom()
-        super().mousePressEvent(event)
-
-    # ------------------------------------------------------------------
-    # Click vs drag detection (for playhead vs zoom)
-    # ------------------------------------------------------------------
-    def _on_button_press(self, event):
-        """Store the press event to later decide if it was a click or a drag."""
-        if event.button != 1:
-            return
-        if event.inaxes != self.ax:
-            return
-        self._press_event = event
-
-    def _on_button_release(self, event):
-        """
-        On release, if the mouse did not move much, treat this as a click
-        and emit time_clicked. If there was a real drag, we consider it a
-        zoom rectangle (handled by RectangleSelector).
-        """
-        if event.button != 1:
-            return
-        if event.inaxes != self.ax:
-            return
-        if self._press_event is None:
-            return
-
-        dx = event.x - self._press_event.x
-        dy = event.y - self._press_event.y
-        dist2 = dx * dx + dy * dy
-
-        click_threshold = 5  # pixels
-        if dist2 <= click_threshold * click_threshold:
-            if event.xdata is not None:
-                self.time_clicked.emit(float(event.xdata))
-
-        self._press_event = None
+        # Re-add playhead (if removed by clear)
+        if self.playhead_line not in self.plot.items():
+            self.plot.addItem(self.playhead_line)
 
     # ------------------------------------------------------------------
     # Playhead line
     # ------------------------------------------------------------------
     def update_playhead(self, time_sec: float):
         """
-        Draw or move the vertical red playhead line at the given time (seconds).
-        This is intended to be called frequently (e.g. from a QTimer).
+        Move the red playhead line. Very cheap operation.
         """
-        if self.ax is None:
-            return
+        self.playhead_line.setValue(time_sec)
 
-        if self.playhead_line is None:
-            self.playhead_line = self.ax.axvline(
-                time_sec,
-                color="#ff4444",
-                linewidth=2.0,
-            )
-        else:
-            self.playhead_line.set_xdata([time_sec, time_sec])
-
-        # Light redraw, does not recompute the spectrogram
-        self.draw_idle()
-
+    # ------------------------------------------------------------------
+    # Annotations
+    # ------------------------------------------------------------------
     def clear_annotations(self):
-        """Remove existing annotation rectangles from the axes."""        
-        for p in getattr(self, "annotation_patches", []):
-            p.remove()
-        self.annotation_patches = []
+        """
+        Remove existing annotation regions from the plot.
+        """
+        for region in self.annotation_regions:
+            self.plot.removeItem(region)
+        self.annotation_regions = []
         self.annotations = []
-        self.draw_idle()
+        self.selected_annotation = None
 
     def draw_annotations(self, annotations):
-        self.annotations = annotations
-        self.annotation_patches = []
+        """
+        Draw annotation regions (vertical bands).
+        Non-selected: blue, Selected: green.
+        """
+        # Remove old
+        self.clear_annotations()
 
-        for ann in annotations:
-            # Determine color depending on selection
-            if ann is self.selected_annotation:
-                edge = "#00ff44"      # green
-                fill = "#00ff4433"    # green transparent
-            else:
-                edge = "#0099ff"      # blue
-                fill = "#0099ff33"    # blue transparent
+        if self.times is None or self.freqs is None:
+            return
 
-            rect = patches.Rectangle(
-                (ann.start, self._full_ylim[0]),
-                ann.end - ann.start,
-                self._full_ylim[1] - self._full_ylim[0],
-                linewidth=1.5,
-                edgecolor=edge,
-                facecolor=fill,
-                picker=True,
-                zorder=50,
+        self.annotations = list(annotations)
+        self.annotation_regions = []
+
+        for ann in self.annotations:
+            region = pg.LinearRegionItem(
+                values=[ann.start, ann.end],
+                orientation="vertical",
+                movable=False,
             )
 
-            self.ax.add_patch(rect)
-            self.annotation_patches.append(rect)
+            # # Color depending on selection
+            # if ann is self.selected_annotation:
+            #     pen = pg.mkPen("#00ff44", width=2)         # green
+            #     brush = pg.mkBrush(0, 255, 68, 60)
+            # else:
+            #     pen = pg.mkPen("#0099ff", width=2)         # blue
+            #     brush = pg.mkBrush(0, 153, 255, 60)
+            # Color depending on class
+            if ann.label =="Lamantin":
+                pen = pg.mkPen("#00ff44", width=2)         # green
+                brush = pg.mkBrush(0, 255, 68, 60)
+            else:
+                pen = pg.mkPen("#0099ff", width=2)         # blue
+                brush = pg.mkBrush(0, 153, 255, 60)
 
-        self.draw_idle()
+            region.setBrush(brush)
+            region.lines[0].setPen(pen)
+            region.lines[1].setPen(pen)
+
+            region.setZValue(10)
+
+            self.plot.addItem(region)
+            self.annotation_regions.append(region)
+
+    def _update_annotation_colors(self):
+        for ann, region in zip(self.annotations, self.annotation_regions):
+            if ann is self.selected_annotation:
+                pen = pg.mkPen("#00ff44", width=2)
+                brush = pg.mkBrush(0, 255, 68, 60)
+            else:
+                pen = pg.mkPen("#0099ff", width=2)
+                brush = pg.mkBrush(0, 153, 255, 60)
+            pen.setCosmetic(True)
+            region.setBrush(brush)
+            region.lines[0].setPen(pen)
+            region.lines[1].setPen(pen)
+
+    # ------------------------------------------------------------------
+    # Mouse interactions
+    # ------------------------------------------------------------------
+    def _on_mouse_clicked(self, event):
+        """
+        Handle left / right click:
+        - Left click: if inside an annotation -> select annotation,
+                      else -> move playhead (emit time_clicked)
+        - Right click: reset zoom to full range.
+        """
+        if self.times is None or self.freqs is None:
+            return
+
+        pos = event.scenePos()
+        vb = self.plot.getViewBox()
+        if vb is None:
+            return
+
+        # Map scene position to data coordinates
+        point = vb.mapSceneToView(pos)
+        t = float(point.x())
+        f = float(point.y())
+
+        # Right click: reset zoom
+        if event.button() == Qt.RightButton:
+            self.plot.enableAutoRange(x=True, y=True)
+            return
+
+        if event.button() != Qt.LeftButton:
+            return
+
+        # Ignore clicks outside x-range
+        if t < self.times[0] or t > self.times[-1]:
+            return
+
+        # Check if click hits an annotation
+        hit_ann = None
+        for ann in self.annotations:
+            if ann.start <= t <= ann.end:
+                hit_ann = ann
+                break
+
+        if hit_ann is not None:
+            # Select annotation
+            self.selected_annotation = hit_ann
+            self._update_annotation_colors()
+            self.annotation_clicked.emit(hit_ann)
+        else:
+            # Plain time click: move playhead
+            self.time_clicked.emit(t)
+
+    def _on_time_clicked_from_viewbox(self, t: float):
+        """
+        Called when the user left-clicks (without dragging) in the ViewBox.
+        - If click is inside an annotation -> select annotation
+        - Else -> emit time_clicked for playhead
+        """
+        if self.times is None:
+            return
+
+        hit_ann = None
+        for ann in self.annotations:
+            if ann.start <= t <= ann.end:
+                hit_ann = ann
+                break
+
+        if hit_ann is not None:
+            self.selected_annotation = hit_ann
+            self._update_annotation_colors()
+            self.annotation_clicked.emit(hit_ann)
+        else:
+            self.time_clicked.emit(float(t))
+    def _on_zoom_reset(self):
+        if self.times is None or self.freqs is None:
+            return
+        t_min, t_max = self.times[0], self.times[-1]
+        f_min, f_max = self.freqs[0], self.freqs[-1]
+        self.plot.setXRange(t_min, t_max, padding=0.0)
+        self.plot.setYRange(f_min, f_max, padding=0.0)
 
 class AudioSpectrogramPlayer(QMainWindow):
     """
@@ -516,6 +540,15 @@ class AudioSpectrogramPlayer(QMainWindow):
         self.annotations_by_file = {}    # mapping: file → list[Annotation]
         self.current_annotations = []    # annotations displayed for current audio
         self.current_annotation_patches = []  # rectangles drawn on canvas
+
+        self.max_visible_duration = 10.0   # seconds, max zoom-out window
+        self.window_start = 0.0            # start time of current window (seconds)
+        self.full_duration = None          # full file duration in seconds
+        self.cached_full_audio = False     # True if whole file is in RAM
+
+        self.playhead_timer = QTimer(self)
+        self.playhead_timer.setInterval(30)   # ~33 FPS
+        self.playhead_timer.timeout.connect(self.on_playhead_timer)
 
 
     def _build_ui(self):
@@ -633,9 +666,20 @@ class AudioSpectrogramPlayer(QMainWindow):
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
 
-        self.player.positionChanged.connect(self.on_player_position_changed)
+        # Connect playback audio output
         self.player.setAudioOutput(self.audio_output)
         self.audio_output.setVolume(0.8)
+
+        # Lightweight position update (not for animation)
+        self.player.positionChanged.connect(self.on_player_position_changed)
+
+        # Start/stop smooth animation timer
+        self.player.playbackStateChanged.connect(self.on_playback_state_changed)
+
+        # Smooth playhead animation timer (~33 FPS)
+        self.playhead_timer = QTimer(self)
+        self.playhead_timer.setInterval(30)  # ~33 FPS
+        self.playhead_timer.timeout.connect(self.on_playhead_timer)
 
     def _create_menu(self):
         """Create menu bar with File and Settings menus."""
@@ -833,57 +877,107 @@ class AudioSpectrogramPlayer(QMainWindow):
 
     def load_audio(self, path: str):
         """
-        Load audio data from file path (for spectrogram) and
-        also prepare QMediaPlayer for playback.
+        Load audio metadata and decide whether to cache the full file in memory
+        or work in 10-second streaming windows. Never display more than
+        max_visible_duration seconds at once.
         """
         self.current_audio_path = path
 
+        # Get full duration (seconds) without loading entire file into RAM
         try:
-            # Load audio samples using librosa (mono, original sample rate)
-            audio, sr = librosa.load(path, sr=None, mono=True)
+            full_duration = librosa.get_duration(path=path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error reading audio", f"Could not read audio duration:\n{exc}")
+            return
+
+        # Load a small head chunk just to get the sample rate
+        try:
+            head_audio, sr = librosa.load(path, sr=None, mono=True, duration=min(self.max_visible_duration, 5.0))
         except Exception as exc:
             QMessageBox.critical(self, "Error loading audio", f"Could not load audio file:\n{exc}")
             return
 
-        self.current_audio_data = audio
         self.current_sr = sr
-
-        # Compute basic audio characteristics
-        duration = len(audio) / sr
-        num_samples = len(audio)
-
-        # Reset playhead to start of file
+        self.full_duration = full_duration
         self._playhead_time = 0.0
+        self.window_start = 0.0
 
-        # Compute spectrogram (this also updates db_min/db_max in canvas)
-        self.canvas.plot_spectrogram(audio, sr, self.spectrogram_settings)
+        # Estimate full audio memory usage (mono, float32 ~ 4 bytes/sample)
+        approx_bytes = int(full_duration * sr * 4)
+        max_cache_bytes = self.spectrogram_settings.max_cache_mb * 1024 * 1024
 
+        if approx_bytes <= max_cache_bytes:
+            # Safe to cache entire file in memory
+            try:
+                audio_full, sr_full = librosa.load(path, sr=None, mono=True)
+            except Exception as exc:
+                QMessageBox.critical(self, "Error loading audio", f"Could not load full audio file:\n{exc}")
+                return
+            self.current_audio_data = audio_full
+            self.current_sr = sr_full
+            self.cached_full_audio = True
+        else:
+            # Streaming mode: keep only a small window in memory
+            self.current_audio_data = head_audio
+            self.cached_full_audio = False
 
-        # Clear previous annotation patches
-        self.canvas.clear_annotations()
+        # Set initial visible window (at t=0)
+        self.set_window_start(0.0)
 
-        # Retrieve annotations for this file
-        basename = os.path.basename(path)
-        self.current_annotations = self.annotations_by_file.get(basename, [])
-
-        # Draw them
-        self.canvas.draw_annotations(self.current_annotations)
-
-        self.canvas.selected_annotation = None
-
-        # Build info text
+        # Build info text using full_duration (not just the window length)
+        num_samples = int(self.full_duration * self.current_sr)
         info_lines = [
             f"Current file: {os.path.basename(path)}",
-            f"Sample rate: {sr} Hz  |  Duration: {duration:.2f} s  |  Samples: {num_samples}",
+            f"Sample rate: {self.current_sr} Hz  |  Duration: {self.full_duration:.2f} s  |  Samples: {num_samples}",
         ]
+
+        db_min = getattr(self.canvas, "db_min", None)
+        db_max = getattr(self.canvas, "db_max", None)
+        if db_min is not None and db_max is not None:
+            info_lines.append(f"Spectrogram dB range: min={db_min:.1f} dB  |  max={db_max:.1f} dB")
 
         self.current_file_label.setText("\n".join(info_lines))
 
-        # Update visual playhead line at time = 0
-        self.update_playhead_visual()
-
-        # Prepare QMediaPlayer for playback
+        # Prepare QMediaPlayer for playback (it streams from disk by itself)
         self.player.setSource(QUrl.fromLocalFile(path))
+
+
+    def set_window_start(self, start_time: float):
+        """
+        Set the visible window start time (in seconds), load the corresponding
+        audio window (max 10s) and redraw the spectrogram.
+        """
+        if self.current_audio_path is None or self.current_sr is None or self.full_duration is None:
+            return
+
+        # Clamp start so that window stays inside [0, full_duration]
+        max_start = max(0.0, self.full_duration - self.max_visible_duration)
+        start_time = max(0.0, min(start_time, max_start))
+        self.window_start = start_time
+
+        if self.cached_full_audio and self.current_audio_data is not None:
+            # Use slice from cached full audio
+            sr = self.current_sr
+            start_idx = int(start_time * sr)
+            end_idx = int((start_time + self.max_visible_duration) * sr)
+            audio_window = self.current_audio_data[start_idx:end_idx]
+        else:
+            # Streaming mode: only load this 10s window from disk
+            audio_window, sr = librosa.load(
+                self.current_audio_path,
+                sr=None,
+                mono=True,
+                offset=start_time,
+                duration=self.max_visible_duration,
+            )
+            self.current_sr = sr
+            self.current_audio_data = audio_window
+
+        # Redraw spectrogram for this window
+        self.canvas.plot_spectrogram(audio_window, self.current_sr, self.spectrogram_settings)
+
+        # Update playhead line position relative to this window
+        self.update_playhead_visual()
 
     def on_play_clicked(self):
         """Play the current audio file."""
@@ -897,45 +991,48 @@ class AudioSpectrogramPlayer(QMainWindow):
         self.player.pause()
 
 
-    def on_canvas_time_clicked(self, t_sec: float):
+    def on_canvas_time_clicked(self, t_local: float):
         """
-        Called when the user left-clicks on the spectrogram.
-        Moves the audio playhead to the clicked time.
+        t_local : time inside the current visible 10s window.
+        Convert it to global audio time, move playhead, reposition window if needed.
         """
-        if self.current_sr is None or self.current_audio_data is None:
+        if self.current_sr is None or self.full_duration is None:
             return
 
-        # Clamp time to valid range of the audio
-        duration = len(self.current_audio_data) / self.current_sr
-        t_sec = max(0.0, min(t_sec, duration))
+        # Convert local time -> global time
+        global_t = self.window_start + t_local
 
-        # Remember playhead time and update visual line
-        self._playhead_time = t_sec
+        # Clamp to [0, full_duration]
+        global_t = max(0.0, min(global_t, self.full_duration))
+
+        # Move internal playhead
+        self._playhead_time = global_t
+
+        # Move QMediaPlayer (milliseconds)
+        self.player.setPosition(int(global_t * 1000))
+
+        # If click is outside current window, recenter window
+        if not (self.window_start <= global_t <= self.window_start + self.max_visible_duration):
+            self.set_window_start(global_t - self.max_visible_duration * 0.5)
+
+        # Update visual red line
         self.update_playhead_visual()
-
-        # If there is a loaded media, move QMediaPlayer's position
-        if not self.player.source().isEmpty():
-            position_ms = int(t_sec * 1000.0)
-            self.player.setPosition(position_ms)
-            # If player is already playing, it will continue from this new position.
-            # If it is paused/stopped, the next Play will start from here.
-
 
     def on_player_position_changed(self, pos_ms: int):
         """
-        Keep the playhead line in sync with the actual playback position.
+        Lightweight update; smooth movement is handled by the timer.
         """
-        if self.current_sr is None or self.current_audio_data is None:
-            return
+        self._playhead_time = pos_ms / 1000.0
 
-        t_sec = pos_ms / 1000.0
-        duration = len(self.current_audio_data) / self.current_sr
+    def on_playback_state_changed(self, state):
+        """
+        Start or stop the playhead animation timer.
+        """
+        if state == QMediaPlayer.PlayingState:
+            self.playhead_timer.start()
+        else:
+            self.playhead_timer.stop()
 
-        if t_sec < 0.0 or t_sec > duration + 0.1:
-            return
-
-        self._playhead_time = t_sec
-        self.update_playhead_visual()
 
     def on_annotation_clicked(self, ann: Annotation):
         """
@@ -995,12 +1092,50 @@ class AudioSpectrogramPlayer(QMainWindow):
 
     def update_playhead_visual(self):
         """
-        Update the playhead line on the spectrogram canvas
-        to reflect the current playhead time.
+        Update the playhead line on the spectrogram canvas to reflect
+        the current playhead time relative to the visible window.
         """
-        if self.current_sr is None or self.current_audio_data is None:
+        if self.current_sr is None or self.full_duration is None:
             return
-        self.canvas.update_playhead(self._playhead_time)
+
+        # Global -> local time in current 10s window
+        local_t = self._playhead_time - self.window_start
+        if local_t < 0.0 or local_t > self.max_visible_duration:
+            # Playhead is outside current window; optionally hide it
+            return
+
+        self.canvas.update_playhead(local_t)
+
+    def on_playhead_timer(self):
+        """
+        Called periodically (e.g. every 30 ms) to smoothly update
+        the playhead position and slide the visible 10s window if needed.
+        """
+        if self.player.playbackState() != QMediaPlayer.PlayingState:
+            return
+        if self.current_sr is None or self.full_duration is None:
+            return
+
+        # Get playback position
+        pos_ms = self.player.position()
+        t_sec = pos_ms / 1000.0
+        self._playhead_time = t_sec
+
+        # Auto-slide the visible 10s spectrogram window if file is long
+        if self.full_duration > self.max_visible_duration:
+            margin = 0.2 * self.max_visible_duration  # 20% margin on each side
+
+            if (
+                t_sec < self.window_start + margin
+                or t_sec > self.window_start + self.max_visible_duration - margin
+            ):
+                # Recenter playhead in the window
+                new_start = t_sec - 0.5 * self.max_visible_duration
+                self.set_window_start(new_start)
+
+        # Update red playhead position inside current window
+        self.update_playhead_visual()
+
 
 
     # ---------- Spectrogram settings ----------

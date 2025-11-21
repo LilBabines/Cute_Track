@@ -1,7 +1,7 @@
 -------- PYTHON VERSION : 3.13 ------------------
 
 1.    pip install torch torchvision
-1.    pip install  ultralytics lightning torchmetrics tensorboard pyside6 librosa
+1.    pip install  ultralytics lightning torchmetrics tensorboard pyside6 librosa pyqtgraph
 2.    cd src/
 3.    git clone https://github.com/facebookresearch/sam2.git && cd sam2
 4.    pip install -e .
