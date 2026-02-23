@@ -37,12 +37,13 @@ class DetectionWorker(QtCore.QObject):
     """
     finished = QtCore.Signal(object, object, object)  # (frame_idx, class_names, List[AnnotBox])
     error = QtCore.Signal(str)
-    def __init__(self, frame_idx: int, frame_bgr: np.ndarray, conf: float = 0.5, model_path: str = YOLO_MODEL_PATH):
+    def __init__(self, frame_idx: int, frame_bgr: np.ndarray, conf: float = 0.5, imgsz =1280, model_path: str = YOLO_MODEL_PATH):
         super().__init__()
         self.frame_idx = frame_idx
         self.frame_bgr = frame_bgr
         self.conf = conf
         self.model_path = model_path
+        self.imgsz = imgsz
 
     @QtCore.Slot()
     def run(self):
@@ -56,7 +57,7 @@ class DetectionWorker(QtCore.QObject):
                 DetectionWorker._model = YOLO(self.model_path)
 
             model = DetectionWorker._model
-            res = model.predict(source=self.frame_bgr[..., ::-1], conf=self.conf, verbose=False)[0]
+            res = model.predict(source=self.frame_bgr[..., ::-1],imgsz = self.imgsz, conf=self.conf, verbose=False)[0]
             names = getattr(model, "names", None)
 
             boxes: List[OBBOX] = []
@@ -127,7 +128,7 @@ class DetectFinetuneWorker(QtCore.QObject):
         base_model_path: str,
         out_root: Optional[str] = None,
         epochs: int = 20,
-        imgsz: int = 1024,
+        imgsz: int = 1280,
         batch: int = 16,
         val_split: float = 0.1,
         seed: int = 1337,

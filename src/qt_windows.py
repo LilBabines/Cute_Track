@@ -638,7 +638,7 @@ class Base(QtWidgets.QMainWindow):
         self.worker_thread = QtCore.QThread(self)
 
         print("Launching inference worker...", self.model_path)
-        self.worker = self.model_worker(idx, self.current_frame_bgr, conf=conf, model_path=self.model_path)
+        self.worker = self.model_worker(idx, self.current_frame_bgr, conf=conf,imgsz=1280, model_path=self.model_path)
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
         self.worker.finished.connect(self._on_inference_done)
@@ -1202,7 +1202,7 @@ class OBB_VideoPlayer(Base):
             base_model_path=base_model,
             out_root=os.path.join(os.getcwd(), "finetune_runs"),
             epochs=20,
-            imgsz=640,
+            imgsz=1280,
             batch=16,
             val_split=0.1,
         )

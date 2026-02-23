@@ -198,9 +198,16 @@ def draw_annotations(img_bgr: np.ndarray,
 def find_parallel(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray):
     """Find the parallel line of p1 and p2 passing through p3."""
     # Get the line coefficients (Ax + B = y) for line p1p2
-    A = (p2[1] - p1[1]) / (p2[0] - p1[0])
-    if A == 0:
-        A = 1e-6  # avoid division by zero
+
+    if (p2[0] - p1[0]) ==0:
+
+        A = 10e6
+    elif (p2[1] - p1[1])==0:
+        A = 1e-6
+    
+    else : 
+        A = (p2[1] - p1[1]) / (p2[0] - p1[0])
+    
     B = p3[1] - A * p3[0]
     return A, B
 
