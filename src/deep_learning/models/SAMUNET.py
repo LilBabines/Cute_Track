@@ -20,6 +20,7 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch import Trainer
 import numpy as np
 from torchmetrics.segmentation import DiceScore
+from torchmetrics.classification import BinaryPrecision, BinaryRecall, BinaryF1Score
 
 def structure_loss(pred, mask):
 
@@ -212,6 +213,9 @@ class SAM2UNet(nn.Module):
         self.side2 = nn.Conv2d(64, 1, kernel_size=1)
         self.head = nn.Conv2d(64, 1, kernel_size=1)
 
+
+        self.encoder.train()
+
     def forward(self, x):
         x1, x2, x3, x4 = self.encoder(x)
         x1, x2, x3, x4 = self.rfb1(x1), self.rfb2(x2), self.rfb3(x3), self.rfb4(x4)
@@ -225,10 +229,8 @@ class SAM2UNet(nn.Module):
         return out, out1, out2
 
 def _to_onehot2_from_logits(logits, target_01):
-    """logits: (B,1,H,W) ; target_01: (B,1,H,W) in {0,1}
-       return: preds_onehot, target_onehot both (B,2,H,W)"""
-    probs = torch.sigmoid(logits)
-    preds2 = torch.cat([1.0 - probs, probs], dim=1)
+    preds_hard = (torch.sigmoid(logits) > 0.5).float()
+    preds2 = torch.cat([1.0 - preds_hard, preds_hard], dim=1)
     tgt2   = torch.cat([1.0 - target_01, target_01], dim=1)
     return preds2, tgt2
 
@@ -265,14 +267,42 @@ class LitBinarySeg(L.LightningModule):
         self.val_dice   = DiceScore(**metric_kwargs)
         self.test_dice  = DiceScore(**metric_kwargs)
 
+        for stage in ("train", "val", "test"):
+            setattr(self, f"{stage}_precision", BinaryPrecision())
+            setattr(self, f"{stage}_recall",    BinaryRecall())
+            setattr(self, f"{stage}_f1",        BinaryF1Score())
+
+
     # -------- utils
     def _dice_loss(self, logits, target, eps=1e-6):
         probs = torch.sigmoid(logits)
         inter = (probs * target).sum(dim=(2, 3))
         den = probs.sum(dim=(2, 3)) + target.sum(dim=(2, 3)) + eps
-        dice = (2 * inter / den)
-        return 1 - dice  # minimiser (1 - dice)
+        dice = (2 * inter + eps) / den
+        loss = 1 - dice
+
+        # ignorer les images sans positif (masque vide)
+        has_pos = target.sum(dim=(2, 3)) > 0
+        if has_pos.any():
+            return loss[has_pos].mean()
+        else:
+            return torch.tensor(0.0, device=logits.device)
     
+    def _update_prf_metrics(self, stage: str, logits, target):
+        """Met à jour Precision, Recall, F1 pour le split donné."""
+        preds = (torch.sigmoid(logits) > 0.5).long().view(-1)
+        tgt = target.long().view(-1)
+        getattr(self, f"{stage}_precision").update(preds, tgt)
+        getattr(self, f"{stage}_recall").update(preds, tgt)
+        getattr(self, f"{stage}_f1").update(preds, tgt)
+
+    def _log_and_reset_prf(self, stage: str):
+        """Compute, log et reset en fin d'époque."""
+        for name in ("precision", "recall", "f1"):
+            metric = getattr(self, f"{stage}_{name}")
+            self.log(f"{stage}/{name}", metric.compute(), prog_bar=(name == "f1"), on_step=False, on_epoch=True)
+            metric.reset()
+
     def _compute_losses(self, preds_tuple, target):
         out, out1, out2 = preds_tuple
 
@@ -282,7 +312,7 @@ class LitBinarySeg(L.LightningModule):
         
         dice_main_no_mean = self._dice_loss(out, target)
 
-        dice_main = dice_main_no_mean.mean()
+        dice_main = dice_main_no_mean
         loss_main = bce_main + self.hparams.dice_weight * dice_main
         loss_main_no_mean = bce_main_no_mean + self.hparams.dice_weight * dice_main_no_mean
 
@@ -292,8 +322,8 @@ class LitBinarySeg(L.LightningModule):
             w1, w2 = self.hparams.aux_weights
             tgt1 = F.interpolate(target, size=out1.shape[-2:], mode="nearest")
             tgt2 = F.interpolate(target, size=out2.shape[-2:], mode="nearest")
-            bce1 = self.bce_loss(out1, tgt1)
-            bce2 = self.bce_loss(out2, tgt2)
+            bce1 = self.bce_loss(out1, tgt1).mean(dim=(2,3)).mean()
+            bce2 = self.bce_loss(out2, tgt2).mean(dim=(2,3)).mean()
             dice1 = self._dice_loss(out1, tgt1)
             dice2 = self._dice_loss(out2, tgt2)
             loss1 = bce1 + self.hparams.dice_weight * dice1
@@ -348,6 +378,7 @@ class LitBinarySeg(L.LightningModule):
 
         loss, losses_dict, losses_not_mean = self._compute_losses(preds, y)
         self._update_dice_epoch_metric(stage, preds[0], y)
+        self._update_prf_metrics(stage, preds[0], y)
         # self._log_step_dice_mean_if_needed(stage, preds, y)
 
         # logs des pertes
@@ -361,6 +392,7 @@ class LitBinarySeg(L.LightningModule):
     def on_train_epoch_end(self):
         dice = self.train_dice.compute()
         self.log("train/dice", dice, prog_bar=True, on_step=False, on_epoch=True)
+        self._log_and_reset_prf("train")
         self.train_dice.reset()
 
     def validation_step(self, batch, batch_idx):
@@ -369,6 +401,7 @@ class LitBinarySeg(L.LightningModule):
     def on_validation_epoch_end(self):
         dice = self.val_dice.compute()
         self.log("val/dice", dice, prog_bar=True, on_step=False, on_epoch=True)
+        self._log_and_reset_prf("val")
         self.val_dice.reset()
 
     def test_step(self, batch, batch_idx):
@@ -384,12 +417,14 @@ class LitBinarySeg(L.LightningModule):
         return out  # logits (B,1,H,W)
 
     def configure_optimizers(self):
-        opt = torch.optim.AdamW(
-            (p for p in self.parameters() if p.requires_grad),
-            lr=self.hparams.lr, weight_decay=self.hparams.weight_decay
-        )
-        if not self.hparams.use_scheduler:
-            return opt
+        encoder_params = list(self.net.encoder.parameters())
+        encoder_ids = {id(p) for p in encoder_params}
+        decoder_params = [p for p in self.net.parameters() if id(p) not in encoder_ids and p.requires_grad]
+
+        opt = torch.optim.AdamW([
+            {"params": encoder_params, "lr": self.hparams.lr},          # 1e-5
+            {"params": decoder_params, "lr": self.hparams.lr * 10},     # 1e-4
+        ], weight_decay=self.hparams.weight_decay)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt, T_max=self.trainer.max_epochs if self.trainer is not None else 100
         )

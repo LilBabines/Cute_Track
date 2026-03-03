@@ -15,7 +15,7 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     np.random.seed(42)
 
-    exp_name = "tiny_freeze_for_noisy_detect"
+    exp_name = "new_anot_data_pos30_dice_seuil_deep_serpvision"
 
     #define callbacks
     cb_checkpoint = ModelCheckpoint(
@@ -24,26 +24,27 @@ if __name__ == "__main__":
         save_top_k=1,
         mode="max",
     )
-    record_D = Record_train_dynamics(save_dir="logs/", name=exp_name)
+    # record_D = Record_train_dynamics(save_dir="logs/", name=exp_name)
 
     #initialize model, litmodule, trainer, datamodule
-    net = SAM2UNet(config="tiny", sam_checkpoint_path="src/sam2/checkpoints/sam2.1_hiera_tiny.pt", freeze_encorder = True).to("cuda")
+    net = SAM2UNet(config="tiny", sam_checkpoint_path="src/sam2/checkpoints/sam2.1_hiera_tiny.pt", freeze_encorder = False).to("cuda")
     lit = LitBinarySeg(
         net,
-        deep_supervision=False,
+        deep_supervision=True,
         dice_use_all_outputs=False,      # mets True si tu veux la Dice moyenne (out,out1,out2)
-        pos_weight=200                   # utile si classe rare
+        pos_weight=30                   # utile si classe rare
     )
     trainer = Trainer(accelerator="auto", devices=1, 
                       max_epochs=100,
+                      log_every_n_steps=50,
                       logger=TensorBoardLogger(save_dir="logs/", name=exp_name, version="tensorboard"),
-                      callbacks=[cb_checkpoint, record_D])
+                      callbacks=[cb_checkpoint,])# record_D
     
     data_module = DataModule512Mask(
-        dataset_path="datasets/Train_005",
-        batch_size=8,
-        num_workers=4,
-        keep_pourcent=0.025
+        dataset_path="datasets/new_anot/datasets_new",
+        batch_size=16,
+        num_workers=8,
+        keep_pourcent=1
     )
 
     trainer.fit(lit, datamodule=data_module)

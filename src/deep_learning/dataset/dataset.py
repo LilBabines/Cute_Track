@@ -25,10 +25,10 @@ class DataSet512Mask(Dataset):
     def __init__(self, images_paths, masks_paths, transform=None, keep_pourcent = 1):
 
         self.transform = ToTensor()
-        lambda_transform = lambda x: ((x-1)*-1).abs()
+        # lambda_transform = lambda x: ((x-1)*-1).abs()
         normalize = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         self.transform_image = Compose([self.transform, normalize])
-        self.transform_mask = Compose([self.transform, lambda_transform])
+        self.transform_mask = Compose([self.transform]) #, lambda_transform
         self.images = sorted(images_paths)
         self.masks = sorted(masks_paths)
         if keep_pourcent < 1:
@@ -94,28 +94,23 @@ class DataModule512Mask(L.LightningDataModule):
         masks_files = np.array(sorted(glob.glob(os.path.join(self.dataset_path, "GT_Object", "*.png"))))
 
         np.random.seed(42)
-        # train_idx = np.random.choice(len(images_files), int((1 - self.val_split)*len(images_files)), replace=False)
-        # val_idx = np.array([i for i in range(len(images_files)) if i not in train_idx])
 
-        # train_idx_2_pourcent = np.random.choice(train_idx, max(10, int(0.000005*len(train_idx))), replace=False)
-        # train_idx = train_idx_2_pourcent
+        train_idx = np.random.choice(len(images_files), int((1 - self.val_split)*len(images_files)), replace=False)
+        val_idx = np.array([i for i in range(len(images_files)) if i not in train_idx])
 
-        # val_idx_2_pourcent = np.random.choice(val_idx, max(12, int(0.000005*len(val_idx))), replace=False)
-        # val_idx = val_idx_2_pourcent
-
-        # train_images = images_files[train_idx]
-        # train_masks = masks_files[train_idx]
-        # val_images = images_files[val_idx]
-        # val_masks = masks_files[val_idx]
+        train_images = images_files[train_idx]
+        train_masks = masks_files[train_idx]
+        val_images = images_files[val_idx]
+        val_masks = masks_files[val_idx]
 
         self.train_dataset = DataSet512Mask(
-            images_paths=images_files,
-            masks_paths=masks_files,
+            images_paths=train_images,
+            masks_paths=train_masks,
             keep_pourcent=1
         )
         self.val_dataset = DataSet512Mask(
-            images_paths=images_files,
-            masks_paths=masks_files,
+            images_paths=val_images,
+            masks_paths=val_masks,
             keep_pourcent=1
         )
         
