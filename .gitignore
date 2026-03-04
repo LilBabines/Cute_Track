@@ -228,3 +228,5 @@ datasets/
 checkpoints/
 *.ckpt
 *logs/
+
+*.safetensors

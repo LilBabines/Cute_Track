@@ -1,5 +1,6 @@
 
 from src.deep_learning.models.SAMUNET import LitBinarySeg, SAM2UNet
+from src.deep_learning.models.SAMUNext import SAM2UNeXT
 from lightning.pytorch.callbacks import ModelCheckpoint
 from src.deep_learning.utils_dl import Record_train_dynamics
 from src.deep_learning.dataset.dataset import DataModule512Mask
@@ -15,7 +16,7 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     np.random.seed(42)
 
-    exp_name = "new_anot_data_pos30_dice_seuil_deep_serpvision"
+    exp_name = "samunext"
 
     #define callbacks
     cb_checkpoint = ModelCheckpoint(
@@ -27,10 +28,12 @@ if __name__ == "__main__":
     # record_D = Record_train_dynamics(save_dir="logs/", name=exp_name)
 
     #initialize model, litmodule, trainer, datamodule
-    net = SAM2UNet(config="tiny", sam_checkpoint_path="src/sam2/checkpoints/sam2.1_hiera_tiny.pt", freeze_encorder = False).to("cuda")
+    # net = SAM2UNet(config="tiny", sam_checkpoint_path="src/sam2/checkpoints/sam2.1_hiera_tiny.pt", freeze_encorder = False).to("cuda")
+    net = SAM2UNeXT(checkpoint_path="models/sam2_hiera_large.pt",dinov2_path="models/model.safetensors").to("cuda")
+
     lit = LitBinarySeg(
         net,
-        deep_supervision=True,
+        deep_supervision=False,
         dice_use_all_outputs=False,      # mets True si tu veux la Dice moyenne (out,out1,out2)
         pos_weight=30                   # utile si classe rare
     )
@@ -42,7 +45,7 @@ if __name__ == "__main__":
     
     data_module = DataModule512Mask(
         dataset_path="datasets/new_anot/datasets_new",
-        batch_size=16,
+        batch_size=8,
         num_workers=8,
         keep_pourcent=1
     )

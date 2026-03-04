@@ -53,13 +53,19 @@ if __name__ == "__main__":
 
     outdir_mask = "/home/auguste/Desktop/Cute_Track/datasets/new_anot/datasets_new/GT_Object"
     outdir_img = "/home/auguste/Desktop/Cute_Track/datasets/new_anot/datasets_new/images"
+    output_json = "/home/auguste/Desktop/Cute_Track/datasets/new_anot/datasets_new/json"
+
     Path(outdir_mask).mkdir(parents=True, exist_ok=True)
     Path(outdir_img).mkdir(parents=True, exist_ok=True)
+    Path(output_json).mkdir(parents=True, exist_ok=True)
 
     for jf in tqdm(json_files):
         ward = jf.parent.name
         out = Path(outdir_mask) / f"{ward}_{jf.stem}.png"
-        json_to_mask(jf, output_path=out)
-        copy_image(jf, jf.parent, outdir_img)
+        dst = Path(output_json) / f"{ward}_{jf.stem}.json"
+
+        shutil.copy2(jf, dst)
+        # json_to_mask(jf, output_path=out)
+        # copy_image(jf, jf.parent, outdir_img)
 
     print(f"\nTerminé — {len(json_files)} masque(s) généré(s).")
