@@ -232,3 +232,7 @@ checkpoints/
 
 
 *.zip
+
+*.safetensors
+
+runs/

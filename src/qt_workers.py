@@ -11,7 +11,7 @@ try:
 except ImportError:
     YOLO = None
 
-#SAM2-UNet
+# -------- SAM2-UNet --------
 from src.deep_learning.models.SAMUNET import SAM2UNet, LitBinarySeg
 import torch
 from torchvision.transforms import ToTensor, Normalize, Compose, Resize
@@ -21,23 +21,37 @@ from lightning.pytorch import Trainer
 from lightning.pytorch.loggers import TensorBoardLogger
 import cv2
 
-# ------ Local imports from utils.py ------
+# ------ Local imports ------
 from .utils import OBBOX, PolyClass, rect_to_poly_xyxy, mask_to_polys, polys_to_mask
 
 
-YOLO_MODEL_PATH = "./models/best.pt"  # your OBB checkpoint
-SAM2_UNET_MODEL_PATH = "./models/tiny_last.ckpt"  # your SAM2 UNet checkpoint
-    
+YOLO_MODEL_PATH = "./models/best26n-obb.pt"
+SAM2_UNET_MODEL_PATH = "./models/tiny_last.ckpt"
+SAM2_CHECKPOINT_PATH = "src/sam2/checkpoints/sam2.1_hiera_tiny.pt"
+
+
+# ---------------------------------------------------------------------------
+# Detection (YOLO-OBB)
+# ---------------------------------------------------------------------------
+
 class DetectionWorker(QtCore.QObject):
-    """
-    Worker for performing object detection on a frame using YOLO-OBB.
+    """Run oriented-bounding-box detection on a single frame using YOLO-OBB.
+
     Signals:
-        finished(int, List[str], List[OBBOX])  # frame_idx, class_names, List of detected OBBOX
+        finished(frame_idx, class_names, List[OBBOX])
         error(str)
     """
-    finished = QtCore.Signal(object, object, object)  # (frame_idx, class_names, List[AnnotBox])
+    finished = QtCore.Signal(object, object, object)
     error = QtCore.Signal(str)
-    def __init__(self, frame_idx: int, frame_bgr: np.ndarray, conf: float = 0.5, imgsz =1280, model_path: str = YOLO_MODEL_PATH):
+
+    def __init__(
+        self,
+        frame_idx: int,
+        frame_bgr: np.ndarray,
+        conf: float = 0.5,
+        imgsz: int = 1024,
+        model_path: str = YOLO_MODEL_PATH,
+    ):
         super().__init__()
         self.frame_idx = frame_idx
         self.frame_bgr = frame_bgr
@@ -51,19 +65,24 @@ class DetectionWorker(QtCore.QObject):
             if YOLO is None:
                 raise RuntimeError("Ultralytics is not installed. `pip install ultralytics`")
 
+            # Lazy-load: cache model on the class to avoid reloading each frame
             if not hasattr(DetectionWorker, "_model"):
-                # if not os.path.isfile(self.model_path):
-                #     raise FileNotFoundError(f"Model not found: {self.model_path}")
                 DetectionWorker._model = YOLO(self.model_path)
 
             model = DetectionWorker._model
-            res = model.predict(source=self.frame_bgr[..., ::-1],imgsz = self.imgsz, conf=self.conf, verbose=False)[0]
+            # BGR→RGB for ultralytics
+            res = model.predict(
+                source=self.frame_bgr[..., ::-1],
+                imgsz=self.imgsz,
+                conf=self.conf,
+                verbose=False,
+            )[0]
             names = getattr(model, "names", None)
 
             boxes: List[OBBOX] = []
 
-            # Preferred: OBB polys directly
-            if hasattr(res, "obb") and (res.obb is not None) and (len(res.obb) > 0):
+            # --- Preferred path: OBB polygons directly ---
+            if hasattr(res, "obb") and res.obb is not None and len(res.obb) > 0:
                 obb = res.obb
                 polys = getattr(obb, "xyxyxyxy", None)
                 cls = getattr(obb, "cls", None)
@@ -71,35 +90,35 @@ class DetectionWorker(QtCore.QObject):
 
                 if polys is not None and len(polys) > 0:
                     P = polys.cpu().numpy() if hasattr(polys, "cpu") else np.asarray(polys)
-                    C = cls.cpu().numpy() if hasattr(cls, "cpu") else np.asarray(cls) if cls is not None else np.zeros((len(P),))
-                    S = conf.cpu().numpy() if hasattr(conf, "cpu") else np.asarray(conf) if conf is not None else np.ones((len(P),))
+                    C = cls.cpu().numpy() if hasattr(cls, "cpu") else np.asarray(cls) if cls is not None else np.zeros(len(P))
+                    S = conf.cpu().numpy() if hasattr(conf, "cpu") else np.asarray(conf) if conf is not None else np.ones(len(P))
                     for p, c, s in zip(P, C, S):
                         boxes.append(OBBOX(poly=p.reshape(4, 2).astype(np.float32), cls_id=int(c), conf=float(s)))
-
                 else:
-                    # Fallback: xywhr -> polygon
+                    # Fallback: xywhr → polygon via rotation matrix
                     xywhr = getattr(obb, "xywhr", None)
                     if xywhr is not None and len(xywhr) > 0:
                         X = xywhr.cpu().numpy() if hasattr(xywhr, "cpu") else np.asarray(xywhr)
-                        C = cls.cpu().numpy() if hasattr(cls, "cpu") else np.asarray(cls) if cls is not None else np.zeros((len(X),))
-                        S = conf.cpu().numpy() if hasattr(conf, "cpu") else np.asarray(conf) if conf is not None else np.ones((len(X),))
+                        C = cls.cpu().numpy() if hasattr(cls, "cpu") else np.asarray(cls) if cls is not None else np.zeros(len(X))
+                        S = conf.cpu().numpy() if hasattr(conf, "cpu") else np.asarray(conf) if conf is not None else np.ones(len(X))
                         for (cx, cy, w, h, rad), c, s in zip(X, C, S):
                             rect = np.array([[-w/2, -h/2],
                                              [ w/2, -h/2],
                                              [ w/2,  h/2],
                                              [-w/2,  h/2]], dtype=np.float32)
-                            c0, s0 = np.cos(rad), np.sin(rad)
-                            R = np.array([[c0, -s0], [s0, c0]], dtype=np.float32)
+                            cos_r, sin_r = np.cos(rad), np.sin(rad)
+                            R = np.array([[cos_r, -sin_r],
+                                          [sin_r,  cos_r]], dtype=np.float32)
                             pts = rect @ R.T + np.array([cx, cy], dtype=np.float32)
-                            boxes.append(OBBOX(poly=pts.astype(np.float32), cls_id=int(c), conf=float(s)))
-            else:
-                # Axis-aligned fallback
-                if res.boxes is not None and len(res.boxes) > 0:
-                    xyxy = res.boxes.xyxy.cpu().numpy()
-                    C = res.boxes.cls.cpu().numpy() if hasattr(res.boxes, "cls") else np.zeros((len(xyxy),))
-                    S = res.boxes.conf.cpu().numpy() if hasattr(res.boxes, "conf") else np.ones((len(xyxy),))
-                    for (x1, y1, x2, y2), c, s in zip(xyxy, C, S):
-                        boxes.append(OBBOX(poly=rect_to_poly_xyxy(x1, y1, x2, y2), cls_id=int(c), conf=float(s)))
+                            boxes.append(OBBOX(poly=pts, cls_id=int(c), conf=float(s)))
+
+            # --- Axis-aligned fallback ---
+            elif res.boxes is not None and len(res.boxes) > 0:
+                xyxy = res.boxes.xyxy.cpu().numpy()
+                C = res.boxes.cls.cpu().numpy() if hasattr(res.boxes, "cls") else np.zeros(len(xyxy))
+                S = res.boxes.conf.cpu().numpy() if hasattr(res.boxes, "conf") else np.ones(len(xyxy))
+                for (x1, y1, x2, y2), c, s in zip(xyxy, C, S):
+                    boxes.append(OBBOX(poly=rect_to_poly_xyxy(x1, y1, x2, y2), cls_id=int(c), conf=float(s)))
 
             self.finished.emit(self.frame_idx, names, boxes)
 
@@ -107,13 +126,16 @@ class DetectionWorker(QtCore.QObject):
             self.error.emit(str(e))
 
 
+# ---------------------------------------------------------------------------
+# Detection fine-tuning
+# ---------------------------------------------------------------------------
 
 class DetectFinetuneWorker(QtCore.QObject):
-    """
-    Build a YOLO-OBB dataset from verified polygons and fine-tune the model.
+    """Build a YOLO-OBB dataset from verified polygons and fine-tune the model.
+
     Signals:
-        progress(str, float)  # message, 0..1
-        finished(str)         # path to best.pt
+        progress(str, float)   — message + progress in [0, 1]
+        finished(str)          — path to best.pt
         error(str)
     """
     progress = QtCore.Signal(str, float)
@@ -123,16 +145,15 @@ class DetectFinetuneWorker(QtCore.QObject):
     def __init__(
         self,
         video_path: str,
-        dataset: Dict[int, List[OBBOX]],   # verified only, as in your app
+        dataset: Dict[int, List[OBBOX]],
         class_names: List[str],
         base_model_path: str,
         out_root: Optional[str] = None,
         epochs: int = 20,
-        imgsz: int = 1280,
-        batch: int = 16,
+        imgsz: int = 1024,
+        batch: int = 8,
         val_split: float = 0.1,
         seed: int = 1337,
-        dataset_images_paths: Dict[int, str] = None,
     ):
         super().__init__()
         self.video_path = video_path
@@ -149,104 +170,97 @@ class DetectFinetuneWorker(QtCore.QObject):
     @QtCore.Slot()
     def run(self):
         try:
-            # --- checks ---
+            # --- Sanity checks ---
             if YOLO is None:
                 raise RuntimeError("Ultralytics is not installed. `pip install ultralytics`")
             if not os.path.isfile(self.base_model_path):
                 raise FileNotFoundError(f"Base model not found: {self.base_model_path}")
             if not os.path.isfile(self.video_path):
                 raise FileNotFoundError(f"Video not found: {self.video_path}")
-            if not self.class_names or len(self.class_names) == 0:
+            if not self.class_names:
                 raise ValueError("class_names is empty; cannot write dataset.yaml.")
 
-            # --- prepare run dirs ---
+            # --- Prepare run directory tree ---
             ts = time.strftime("%Y%m%d-%H%M%S")
             run_dir = os.path.join(self.out_root, f"run-{ts}")
             img_tr = os.path.join(run_dir, "images", "train")
             img_va = os.path.join(run_dir, "images", "val")
-            lb_tr  = os.path.join(run_dir, "labels", "train")
-            lb_va  = os.path.join(run_dir, "labels", "val")
+            lb_tr = os.path.join(run_dir, "labels", "train")
+            lb_va = os.path.join(run_dir, "labels", "val")
             for p in (img_tr, img_va, lb_tr, lb_va):
                 os.makedirs(p, exist_ok=True)
 
-            self.progress.emit("Preparing frames and labels…", 0.02)
+            self.progress.emit("Preparing frames and labels...", 0.02)
 
-            # --- open video once; fetch size for normalization ---
+            # --- Open video and read dimensions for normalization ---
             cap = cv2.VideoCapture(self.video_path)
             if not cap.isOpened():
                 raise RuntimeError(f"Could not open video: {self.video_path}")
             img_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             img_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
             if img_w <= 0 or img_h <= 0:
-                raise RuntimeError("Could not read video width/height for normalization.")
+                raise RuntimeError("Could not read video dimensions.")
 
-            # deterministic split
+            # Deterministic train/val split
             rng = np.random.default_rng(self.seed)
-            frame_indices = sorted(k for k in self.dataset.keys() if self.dataset[k])
+            frame_indices = sorted(k for k in self.dataset if self.dataset[k])
             rng.shuffle(frame_indices)
             n_val = max(1, int(len(frame_indices) * self.val_split))
             val_set = set(frame_indices[:n_val])
 
-            # --- helpers ---
             def _seek_read(idx: int) -> Optional[np.ndarray]:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
                 ok, frame = cap.read()
                 return frame if ok else None
 
-            def _norm_poly_xyxyxyxy(poly: np.ndarray) -> np.ndarray:
-                # poly: (4,2) in image pixels → normalized in [0,1]
+            def _normalize_poly(poly: np.ndarray) -> np.ndarray:
+                """Normalize a (4, 2) polygon from pixel coords to [0, 1]."""
                 pts = poly.astype(np.float32).copy()
                 pts[:, 0] = np.clip(pts[:, 0] / max(img_w, 1), 0.0, 1.0)
                 pts[:, 1] = np.clip(pts[:, 1] / max(img_h, 1), 0.0, 1.0)
                 return pts
 
-            # --- write images + labels ---
+            # --- Write images and YOLO-OBB label files ---
             written = 0
             for i, fidx in enumerate(frame_indices):
                 frame = _seek_read(fidx)
                 if frame is None:
-                    # skip unreadable frames
                     continue
 
-                subset_is_val = (fidx in val_set)
-                img_dir = img_va if subset_is_val else img_tr
-                lb_dir  = lb_va if subset_is_val else lb_tr
+                is_val = fidx in val_set
+                img_dir = img_va if is_val else img_tr
+                lb_dir = lb_va if is_val else lb_tr
 
                 stem = f"frame_{fidx:06d}"
-                img_path = os.path.join(img_dir, stem + ".jpg")
-                lb_path  = os.path.join(lb_dir,  stem + ".txt")
+                cv2.imwrite(os.path.join(img_dir, stem + ".jpg"), frame)
 
-                # save image
-                cv2.imwrite(img_path, frame)
-
-                # create label lines (YOLO-OBB format: cls x1 y1 x2 y2 x3 y3 x4 y4, normalized)
+                # YOLO-OBB format: cls x1 y1 x2 y2 x3 y3 x4 y4 (normalized)
                 lines = []
                 for ann in self.dataset.get(fidx, []):
-                    # Expecting PolyClass with fields: poly (4,2), cls_id (int). Adjust if your name differs.
                     poly = getattr(ann, "poly", None)
                     cls_id = int(getattr(ann, "cls_id", -1))
                     if poly is None or np.asarray(poly).shape != (4, 2) or cls_id < 0:
                         continue
-                    pts = _norm_poly_xyxyxyxy(np.asarray(poly))
+                    pts = _normalize_poly(np.asarray(poly))
                     flat = " ".join(f"{v:.6f}" for v in pts.reshape(-1))
                     lines.append(f"{cls_id} {flat}")
 
-                # if no labels, still write empty file (YOLO expects a .txt per image)
-                with open(lb_path, "w", encoding="utf-8") as f:
+                # YOLO expects a .txt per image even if empty
+                with open(os.path.join(lb_dir, stem + ".txt"), "w", encoding="utf-8") as f:
                     f.write("\n".join(lines))
 
                 written += 1
-                # simple progress
-                self.progress.emit(f"Wrote {written}/{len(frame_indices)} samples…", 0.05 + 0.6 * (i + 1) / max(len(frame_indices), 1))
+                self.progress.emit(
+                    f"Wrote {written}/{len(frame_indices)} samples...",
+                    0.05 + 0.6 * (i + 1) / max(len(frame_indices), 1),
+                )
 
             cap.release()
 
             if written == 0:
-                raise RuntimeError("No samples were written. Check that dataset has verified annotations.")
+                raise RuntimeError("No samples written. Check that the dataset has verified annotations.")
 
-            # --- dataset.yaml ---
-            # names can be list (Ultralytics accepts list or dict)
+            # --- Write dataset.yaml ---
             data_yaml = os.path.join(run_dir, "dataset.yaml")
             with open(data_yaml, "w", encoding="utf-8") as f:
                 f.write(
@@ -255,38 +269,36 @@ class DetectFinetuneWorker(QtCore.QObject):
                     f"val: finetune_runs/run-{ts}/images/val\n"
                     "names:\n"
                 )
-                for i, n in enumerate(self.class_names):
-                    f.write(f"  {i}: {n}\n")
+                for idx, name in enumerate(self.class_names):
+                    f.write(f"  {idx}: {name}\n")
 
-            self.progress.emit("Launching training…", 0.70)
+            self.progress.emit("Launching training...", 0.70)
 
-            # --- train ---
-            print(self.base_model_path)
-            model = YOLO(self.base_model_path)  # should be an -obb model (e.g., yolo11n-obb.pt)
-            results = model.train(
+            # --- Train ---
+            model = YOLO(self.base_model_path)
+            model.train(
                 data=data_yaml,
                 epochs=self.epochs,
                 imgsz=self.imgsz,
                 batch=self.batch,
-                project=run_dir,    # Ultralytics will create run dir subfolder
+                project=run_dir,
                 name="finetune",
                 exist_ok=True,
                 verbose=True,
                 flipud=0.5,
-                fliplr=0.5
+                fliplr=0.5,
             )
 
-            # --- find best.pt ---
+            # --- Locate best weights ---
             weights_dir = os.path.join(run_dir, "finetune", "weights")
             best_pt = os.path.join(weights_dir, "best.pt")
             if not os.path.isfile(best_pt):
-                # fallback to last.pt
                 last_pt = os.path.join(weights_dir, "last.pt")
                 if os.path.isfile(last_pt):
                     best_pt = last_pt
                 else:
                     raise RuntimeError("Training finished but no weights found.")
-            self.progress.emit("Launching training…", 0.70)
+
             self.progress.emit("Training complete.", 0.99)
             self.finished.emit(best_pt)
 
@@ -294,70 +306,113 @@ class DetectFinetuneWorker(QtCore.QObject):
             self.error.emit(str(e))
 
 
+# ---------------------------------------------------------------------------
+# Segmentation (SAM2-UNet)
+# ---------------------------------------------------------------------------
+
 class SegWorker(QtCore.QObject):
-    """
-    Worker for performing segmentation on a frame using SAM2-UNet LightingModule.
+    """Run binary segmentation on a single frame using SAM2-UNet.
+
+    The model operates at 512×512; output polygons are rescaled back
+    to the original image dimensions.
+
     Signals:
-        finished(int, np.ndarray)  # frame_idx, segmentation mask
+        finished(frame_idx, class_names, List[OBBOX])
         error(str)
     """
-    finished = QtCore.Signal(object, object, object)  # (frame_idx, class_names, List[AnnotBox])
+    finished = QtCore.Signal(object, object, object)
     error = QtCore.Signal(str)
-    def __init__(self, frame_idx: int, frame_bgr: np.ndarray, conf: float = 0.5, model_path: str = SAM2_UNET_MODEL_PATH):
+
+    # Input resolution expected by the model
+    MODEL_SIZE = 512
+
+    def __init__(
+        self,
+        frame_idx: int,
+        frame_bgr: np.ndarray,
+        conf: float = 0.5,
+        model_path: str = SAM2_UNET_MODEL_PATH,
+        **kwargs,                       # accept (and ignore) extra keys like imgsz
+    ):
         super().__init__()
         self.frame_idx = frame_idx
         self.frame_bgr = frame_bgr
         self.conf = conf
         self.model_path = model_path
-        print("SegWorker initialized with model path:", model_path)
-        
-    def preprocess(self, frame_bgr: np.ndarray) -> torch.Tensor:
 
-        x = frame_bgr[..., ::-1].copy()
+    def preprocess(self, frame_bgr: np.ndarray) -> torch.Tensor:
+        """BGR uint8 → normalized (1, 3, 512, 512) tensor."""
+        x = frame_bgr[..., ::-1].copy()          # BGR → RGB
         transform = Compose([
             ToTensor(),
-            Resize((512, 512)),
-            Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            Resize((self.MODEL_SIZE, self.MODEL_SIZE)),
+            Normalize(mean=[0.485, 0.456, 0.406],
+                      std=[0.229, 0.224, 0.225]),
         ])
-        x = transform(x)
-        x = x.unsqueeze(0)  # add batch dim
-        return x
+        return transform(x).unsqueeze(0)          # add batch dim
 
     @QtCore.Slot()
     def run(self):
         try:
+            # Lazy-load model (cached on the class)
             if not hasattr(SegWorker, "_model"):
                 if not os.path.isfile(self.model_path):
                     raise FileNotFoundError(f"Model not found: {self.model_path}")
-                print("no _model attribute, loading model from:", self.model_path)
-                net = SAM2UNet(config="tiny", sam_checkpoint_path="src/sam2/checkpoints/sam2.1_hiera_tiny.pt", freeze_encorder = True).to("cuda")
-                lit = LitBinarySeg.load_from_checkpoint(self.model_path, 
-                                                net=net,
-                                                deep_supervision=False,
-                                                dice_use_all_outputs=False,
-                                                pos_weight=200) 
+                net = SAM2UNet(
+                    config="tiny",
+                    sam_checkpoint_path=SAM2_CHECKPOINT_PATH,
+                    freeze_encorder=True,
+                ).to("cuda")
+                lit = LitBinarySeg.load_from_checkpoint(
+                    self.model_path,
+                    net=net,
+                    deep_supervision=False,
+                    dice_use_all_outputs=False,
+                    pos_weight=200,
+                )
                 lit.eval()
                 SegWorker._model = lit.to("cuda")
 
             model = SegWorker._model
             input_tensor = self.preprocess(self.frame_bgr).to("cuda")
+
             with torch.no_grad():
                 res = model(input_tensor).sigmoid()
-            mask = (res[0, 0].cpu().numpy() > self.conf).astype(np.uint8) * 255  # Binary mask
-            polys = mask_to_polys(mask)
-            annot_polys = [OBBOX(poly=p, cls_id=0, conf=1.0) for p in polys]
-            names = ['Building']*len(annot_polys)
+
+            # Binary mask at model resolution
+            mask = (res[0, 0].cpu().numpy() > self.conf).astype(np.uint8) * 255
+
+            # Extract polygons at 512×512, then rescale to original image size
+            orig_h, orig_w = self.frame_bgr.shape[:2]
+            polys_512 = mask_to_polys(mask)
+
+            scale_x = orig_w / self.MODEL_SIZE
+            scale_y = orig_h / self.MODEL_SIZE
+
+            annot_polys = []
+            for p in polys_512:
+                scaled = p.copy()
+                scaled[:, 0] *= scale_x
+                scaled[:, 1] *= scale_y
+                annot_polys.append(OBBOX(poly=scaled.astype(np.float32), cls_id=0, conf=1.0))
+
+            names = ["Building"] * len(annot_polys)
             self.finished.emit(self.frame_idx, names, annot_polys)
 
         except Exception as e:
             self.error.emit(str(e))
 
+
+# ---------------------------------------------------------------------------
+# Segmentation fine-tuning
+# ---------------------------------------------------------------------------
+
 class SegFinetuneWorker(QtCore.QObject):
-    """
-    Worker for fine-tuning the SAM2-UNet model.
+    """Fine-tune the SAM2-UNet model on verified segmentation annotations.
+
     Signals:
-        progress(str, float)  # message, 0..1
-        finished(str)         # path to best.ckpt
+        progress(str, float)   — message + progress in [0, 1]
+        finished(str)          — path to best checkpoint
         error(str)
     """
     progress = QtCore.Signal(str, float)
@@ -366,7 +421,7 @@ class SegFinetuneWorker(QtCore.QObject):
 
     def __init__(
         self,
-        dataset: Dict[int, list[PolyClass]],   # frame_idx -> binary mask
+        dataset: Dict[int, List[PolyClass]],
         dataset_images_names: Dict[int, str],
         base_model_path: str,
         out_root: Optional[str] = None,
@@ -388,48 +443,45 @@ class SegFinetuneWorker(QtCore.QObject):
     @QtCore.Slot()
     def run(self):
         try:
-            # --- checks ---
+            # --- Sanity checks ---
             if not os.path.isfile(self.base_model_path):
                 raise FileNotFoundError(f"Base model not found: {self.base_model_path}")
-            if not self.dataset or len(self.dataset) == 0:
-                raise ValueError("Dataset is empty; cannot proceed with fine-tuning. VERIFY annotations first.")
-            
-            self.progress.emit("Preparering dataset…", 0.02)
+            if not self.dataset:
+                raise ValueError("Dataset is empty; verify annotations first.")
 
-            # --- prepare run dirs ---
+            self.progress.emit("Preparing dataset...", 0.02)
+
+            # --- Prepare run directory ---
             ts = time.strftime("%Y%m%d-%H%M%S")
             exp_name = "finetune_seg"
             run_dir = f"logs/{exp_name}/{ts}"
-            torch.manual_seed(42)
-            np.random.seed(42)
-
             os.makedirs(run_dir, exist_ok=True)
 
-            # --- prepare dataset at datasets/seg_finetune/data{ts} ---
-            self.progress.emit("Preparing dataset…", 0.05)
-            dataset = self.dataset
-            dataset_images_names = self.dataset_images_names
-            os.makedirs("datasets/seg_finetune", exist_ok=True)
+            torch.manual_seed(self.seed)
+            np.random.seed(self.seed)
+
+            # --- Write images and masks to a dataset folder ---
+            self.progress.emit("Preparing dataset...", 0.05)
             data_dir = f"datasets/seg_finetune/data_{ts}"
-            os.makedirs(data_dir, exist_ok=True)
             data_dir_images = os.path.join(data_dir, "images")
+            data_dir_masks = os.path.join(data_dir, "GT_Object")
             os.makedirs(data_dir_images, exist_ok=True)
-            data_dir_masks =  os.path.join(data_dir, "GT_Object")
             os.makedirs(data_dir_masks, exist_ok=True)
 
-            for frame_idx, polys in dataset.items():
-                img_src_path = dataset_images_names.get(frame_idx, None)
+            for frame_idx, polys in self.dataset.items():
+                img_src_path = self.dataset_images_names.get(frame_idx)
                 if img_src_path is None or not os.path.isfile(img_src_path):
                     continue
+
                 img_dst_path = os.path.join(data_dir_images, os.path.basename(img_src_path))
                 cv2.imwrite(img_dst_path, cv2.imread(img_src_path))
-                # create mask
+
+                # Rasterize polygons into a binary mask
                 mask = polys_to_mask(polys, (512, 512))
-                
                 mask_dst_path = os.path.join(data_dir_masks, f"frame_{frame_idx:06d}_mask.png")
                 cv2.imwrite(mask_dst_path, mask)
 
-            #define callbacks
+            # --- Callbacks ---
             cb_checkpoint = ModelCheckpoint(
                 monitor="val/dice",
                 dirpath=run_dir,
@@ -437,29 +489,42 @@ class SegFinetuneWorker(QtCore.QObject):
                 mode="max",
             )
 
-            #initialize model, litmodule, trainer, datamodule
-            net = SAM2UNet(config="tiny", sam_checkpoint_path="src/sam2/checkpoints/sam2.1_hiera_tiny.pt", freeze_encorder = True).to("cuda")
+            # --- Initialize model and trainer ---
+            net = SAM2UNet(
+                config="tiny",
+                sam_checkpoint_path=SAM2_CHECKPOINT_PATH,
+                freeze_encorder=True,
+            ).to("cuda")
+
             lit = LitBinarySeg.load_from_checkpoint(
                 self.base_model_path,
                 net=net,
                 deep_supervision=False,
-                dice_use_all_outputs=False,      # mets True si tu veux la Dice moyenne (out,out1,out2)
-                pos_weight=200                   # utile si classe rare
-            )
-            trainer = Trainer(accelerator="auto", devices=1, 
-                            max_epochs=10,
-                            logger=TensorBoardLogger(save_dir=run_dir, name=exp_name, version=f"{ts}/tensorboard"),
-                            callbacks=[cb_checkpoint])
-            
-            data_module = DataModule512Mask(
-                dataset_path="datasets/seg_finetune/data_"+ts,
-                batch_size=self.batch,
-                val_split=self.val_split
+                dice_use_all_outputs=False,
+                pos_weight=200,
             )
 
+            trainer = Trainer(
+                accelerator="auto",
+                devices=1,
+                max_epochs=self.epochs,         # was hardcoded to 10 — now uses self.epochs
+                logger=TensorBoardLogger(
+                    save_dir=run_dir,
+                    name=exp_name,
+                    version=f"{ts}/tensorboard",
+                ),
+                callbacks=[cb_checkpoint],
+            )
+
+            data_module = DataModule512Mask(
+                dataset_path=data_dir,
+                batch_size=self.batch,
+                val_split=self.val_split,
+            )
+
+            self.progress.emit("Launching training...", 0.70)
             trainer.fit(lit, datamodule=data_module)
 
-            self.progress.emit("Launching training…", 0.70)
             self.progress.emit("Training complete.", 0.99)
             self.finished.emit(cb_checkpoint.best_model_path)
 
