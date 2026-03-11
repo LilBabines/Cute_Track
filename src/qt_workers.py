@@ -1,4 +1,6 @@
 import os
+import sys
+import io
 from typing import Dict, List, Optional
 import time
 
@@ -31,15 +33,44 @@ SAM2_CHECKPOINT_PATH = "src/sam2/checkpoints/sam2.1_hiera_tiny.pt"
 
 
 # ---------------------------------------------------------------------------
-# Detection (YOLO-OBB)
+# Stdout capture helper — thread-safe relay to a Qt signal
 # ---------------------------------------------------------------------------
 
+class _StdoutCapture(io.TextIOBase):
+    """Captures writes to stdout and relays each line via a Qt signal,
+    while still forwarding to the original stdout."""
+
+    def __init__(self, signal: QtCore.SignalInstance, original_stdout):
+        super().__init__()
+        self._signal = signal
+        self._original = original_stdout
+
+    def write(self, text: str):
+        if self._original:
+            self._original.write(text)
+        if text and text.strip():
+            self._signal.emit(text.rstrip("\n"))
+        return len(text) if text else 0
+
+    def flush(self):
+        if self._original:
+            self._original.flush()
+
+    def isatty(self):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Detection (YOLO-OBB)
+# ---------------------------------------------------------------------------
 class DetectionWorker(QtCore.QObject):
     """Run oriented-bounding-box detection on a single frame using YOLO-OBB.
 
-    Signals:
-        finished(frame_idx, class_names, List[OBBOX])
-        error(str)
+    Accepts EITHER:
+      - source_path (str): path to an image file → passed directly to YOLO
+      - frame_bgr (np.ndarray): BGR uint8 array (e.g. from video capture)
+
+    When source_path is given, it takes priority (YOLO handles its own I/O).
     """
     finished = QtCore.Signal(object, object, object)
     error = QtCore.Signal(str)
@@ -47,10 +78,11 @@ class DetectionWorker(QtCore.QObject):
     def __init__(
         self,
         frame_idx: int,
-        frame_bgr: np.ndarray,
+        frame_bgr: np.ndarray = None,
         conf: float = 0.5,
         imgsz: int = 1024,
         model_path: str = YOLO_MODEL_PATH,
+        source_path: str = None,
     ):
         super().__init__()
         self.frame_idx = frame_idx
@@ -58,71 +90,105 @@ class DetectionWorker(QtCore.QObject):
         self.conf = conf
         self.model_path = model_path
         self.imgsz = imgsz
+        self.source_path = source_path
+
+    @classmethod
+    def _get_model(cls, model_path: str):
+        """Lazy-load model, reload if path changed."""
+        if not hasattr(cls, "_model") or cls._model_path != model_path:
+            print(f"[DetectionWorker] Loading model: {model_path}")
+            cls._model = YOLO(model_path)
+            cls._model_path = model_path
+        return cls._model
 
     @QtCore.Slot()
     def run(self):
         try:
-            if YOLO is None:
-                raise RuntimeError("Ultralytics is not installed. `pip install ultralytics`")
 
-            # Lazy-load: cache model on the class to avoid reloading each frame
-            if not hasattr(DetectionWorker, "_model"):
-                DetectionWorker._model = YOLO(self.model_path)
+            model = self._get_model(self.model_path)
 
-            model = DetectionWorker._model
-            # BGR→RGB for ultralytics
-            res = model.predict(
-                source=self.frame_bgr[..., ::-1],
+            # --- Choose source: file path preferred, numpy fallback ---
+            if self.source_path and os.path.isfile(self.source_path):
+                source = self.source_path
+            elif self.frame_bgr is not None:
+                # YOLO expects RGB uint8 when given a numpy array
+                bgr = self.frame_bgr
+                # Safety: ensure uint8 (don't use ensure_bgr_u8, just basic conversion)
+                if bgr.dtype != np.uint8:
+                    if bgr.dtype == np.uint16:
+                        bgr = (bgr / 256).astype(np.uint8)
+                    else:
+                        bgr = bgr.astype(np.uint8)
+                # YOLO's internal pipeline expects BGR (it does its own conversion)
+                # Passing BGR directly — do NOT convert to RGB here
+                source = bgr
+            else:
+                raise RuntimeError("No source_path and no frame_bgr provided.")
+
+            # --- Predict ---
+            results = model.predict(
+                source=source,
                 imgsz=self.imgsz,
                 conf=self.conf,
                 verbose=False,
-            )[0]
+            )
+            res = results[0]
             names = getattr(model, "names", None)
+
+            # --- Debug ---
+            has_obb = hasattr(res, "obb") and res.obb is not None and len(res.obb) > 0
+            has_boxes = res.boxes is not None and len(res.boxes) > 0
 
             boxes: List[OBBOX] = []
 
-            # --- Preferred path: OBB polygons directly ---
-            if hasattr(res, "obb") and res.obb is not None and len(res.obb) > 0:
+            # --- OBB path ---
+            if has_obb:
                 obb = res.obb
                 polys = getattr(obb, "xyxyxyxy", None)
                 cls = getattr(obb, "cls", None)
-                conf = getattr(obb, "conf", None)
+                conf_vals = getattr(obb, "conf", None)
 
                 if polys is not None and len(polys) > 0:
                     P = polys.cpu().numpy() if hasattr(polys, "cpu") else np.asarray(polys)
-                    C = cls.cpu().numpy() if hasattr(cls, "cpu") else np.asarray(cls) if cls is not None else np.zeros(len(P))
-                    S = conf.cpu().numpy() if hasattr(conf, "cpu") else np.asarray(conf) if conf is not None else np.ones(len(P))
-                    for p, c, s in zip(P, C, S):
-                        boxes.append(OBBOX(poly=p.reshape(4, 2).astype(np.float32), cls_id=int(c), conf=float(s)))
+                    C = cls.cpu().numpy() if hasattr(cls, "cpu") else np.zeros(len(P))
+                    S = conf_vals.cpu().numpy() if hasattr(conf_vals, "cpu") else np.ones(len(P))
+                    for i, (p, c, s) in enumerate(zip(P, C, S)):
+                        boxes.append(OBBOX(
+                            poly=p.reshape(4, 2).astype(np.float32),
+                            cls_id=int(c), conf=float(s),
+                        ))
                 else:
-                    # Fallback: xywhr → polygon via rotation matrix
                     xywhr = getattr(obb, "xywhr", None)
                     if xywhr is not None and len(xywhr) > 0:
                         X = xywhr.cpu().numpy() if hasattr(xywhr, "cpu") else np.asarray(xywhr)
-                        C = cls.cpu().numpy() if hasattr(cls, "cpu") else np.asarray(cls) if cls is not None else np.zeros(len(X))
-                        S = conf.cpu().numpy() if hasattr(conf, "cpu") else np.asarray(conf) if conf is not None else np.ones(len(X))
+                        C = cls.cpu().numpy() if hasattr(cls, "cpu") else np.zeros(len(X))
+                        S = conf_vals.cpu().numpy() if hasattr(conf_vals, "cpu") else np.ones(len(X))
                         for (cx, cy, w, h, rad), c, s in zip(X, C, S):
-                            rect = np.array([[-w/2, -h/2],
-                                             [ w/2, -h/2],
-                                             [ w/2,  h/2],
-                                             [-w/2,  h/2]], dtype=np.float32)
+                            rect = np.array([[-w/2, -h/2], [w/2, -h/2],
+                                             [w/2, h/2], [-w/2, h/2]], dtype=np.float32)
                             cos_r, sin_r = np.cos(rad), np.sin(rad)
-                            R = np.array([[cos_r, -sin_r],
-                                          [sin_r,  cos_r]], dtype=np.float32)
+                            R = np.array([[cos_r, -sin_r], [sin_r, cos_r]], dtype=np.float32)
                             pts = rect @ R.T + np.array([cx, cy], dtype=np.float32)
                             boxes.append(OBBOX(poly=pts, cls_id=int(c), conf=float(s)))
 
-            # --- Axis-aligned fallback ---
-            elif res.boxes is not None and len(res.boxes) > 0:
+            # --- AABB fallback ---
+            elif has_boxes:
                 xyxy = res.boxes.xyxy.cpu().numpy()
-                C = res.boxes.cls.cpu().numpy() if hasattr(res.boxes, "cls") else np.zeros(len(xyxy))
-                S = res.boxes.conf.cpu().numpy() if hasattr(res.boxes, "conf") else np.ones(len(xyxy))
+                C = res.boxes.cls.cpu().numpy()
+                S = res.boxes.conf.cpu().numpy()
                 for (x1, y1, x2, y2), c, s in zip(xyxy, C, S):
-                    boxes.append(OBBOX(poly=rect_to_poly_xyxy(x1, y1, x2, y2), cls_id=int(c), conf=float(s)))
+                    boxes.append(OBBOX(
+                        poly=rect_to_poly_xyxy(x1, y1, x2, y2),
+                        cls_id=int(c), conf=float(s),
+                    ))
+                
 
+            print(f"[DetectionWorker] Emitting {len(boxes)} boxes")
             self.finished.emit(self.frame_idx, names, boxes)
 
         except Exception as e:
+            import traceback
+            print(f"[DetectionWorker] EXCEPTION:\n{traceback.format_exc()}")
             self.error.emit(str(e))
 
 
@@ -135,17 +201,19 @@ class DetectFinetuneWorker(QtCore.QObject):
 
     Signals:
         progress(str, float)   — message + progress in [0, 1]
+        epoch_metrics(int, int, dict) — current_epoch, total_epochs, metrics dict
+        log_line(str)          — a line of console output
         finished(str)          — path to best.pt
         error(str)
     """
     progress = QtCore.Signal(str, float)
+    epoch_metrics = QtCore.Signal(int, int, object)   # epoch, total, {metric: value}
+    log_line = QtCore.Signal(str)
     finished = QtCore.Signal(str)
     error = QtCore.Signal(str)
 
     def __init__(
         self,
-        video_path: str,
-        dataset: Dict[int, List[OBBOX]],
         class_names: List[str],
         base_model_path: str,
         out_root: Optional[str] = None,
@@ -154,10 +222,9 @@ class DetectFinetuneWorker(QtCore.QObject):
         batch: int = 8,
         val_split: float = 0.1,
         seed: int = 1337,
+        data_yaml: str = "datasets/datasets_build/dataset.yaml",
     ):
         super().__init__()
-        self.video_path = video_path
-        self.dataset = dataset
         self.class_names = class_names
         self.base_model_path = base_model_path
         self.out_root = out_root or os.path.join(os.getcwd(), "finetune_runs")
@@ -166,118 +233,68 @@ class DetectFinetuneWorker(QtCore.QObject):
         self.batch = int(batch)
         self.val_split = float(val_split)
         self.seed = int(seed)
+        self.data_yaml = data_yaml
 
     @QtCore.Slot()
     def run(self):
+        # Capture stdout so ultralytics console output goes to the GUI
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        sys.stdout = _StdoutCapture(self.log_line, original_stdout)
+        sys.stderr = _StdoutCapture(self.log_line, original_stderr)
+
         try:
-            # --- Sanity checks ---
             if YOLO is None:
                 raise RuntimeError("Ultralytics is not installed. `pip install ultralytics`")
             if not os.path.isfile(self.base_model_path):
                 raise FileNotFoundError(f"Base model not found: {self.base_model_path}")
-            if not os.path.isfile(self.video_path):
-                raise FileNotFoundError(f"Video not found: {self.video_path}")
             if not self.class_names:
                 raise ValueError("class_names is empty; cannot write dataset.yaml.")
 
-            # --- Prepare run directory tree ---
             ts = time.strftime("%Y%m%d-%H%M%S")
             run_dir = os.path.join(self.out_root, f"run-{ts}")
-            img_tr = os.path.join(run_dir, "images", "train")
-            img_va = os.path.join(run_dir, "images", "val")
-            lb_tr = os.path.join(run_dir, "labels", "train")
-            lb_va = os.path.join(run_dir, "labels", "val")
-            for p in (img_tr, img_va, lb_tr, lb_va):
-                os.makedirs(p, exist_ok=True)
 
-            self.progress.emit("Preparing frames and labels...", 0.02)
-
-            # --- Open video and read dimensions for normalization ---
-            cap = cv2.VideoCapture(self.video_path)
-            if not cap.isOpened():
-                raise RuntimeError(f"Could not open video: {self.video_path}")
-            img_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            img_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            if img_w <= 0 or img_h <= 0:
-                raise RuntimeError("Could not read video dimensions.")
-
-            # Deterministic train/val split
-            rng = np.random.default_rng(self.seed)
-            frame_indices = sorted(k for k in self.dataset if self.dataset[k])
-            rng.shuffle(frame_indices)
-            n_val = max(1, int(len(frame_indices) * self.val_split))
-            val_set = set(frame_indices[:n_val])
-
-            def _seek_read(idx: int) -> Optional[np.ndarray]:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                ok, frame = cap.read()
-                return frame if ok else None
-
-            def _normalize_poly(poly: np.ndarray) -> np.ndarray:
-                """Normalize a (4, 2) polygon from pixel coords to [0, 1]."""
-                pts = poly.astype(np.float32).copy()
-                pts[:, 0] = np.clip(pts[:, 0] / max(img_w, 1), 0.0, 1.0)
-                pts[:, 1] = np.clip(pts[:, 1] / max(img_h, 1), 0.0, 1.0)
-                return pts
-
-            # --- Write images and YOLO-OBB label files ---
-            written = 0
-            for i, fidx in enumerate(frame_indices):
-                frame = _seek_read(fidx)
-                if frame is None:
-                    continue
-
-                is_val = fidx in val_set
-                img_dir = img_va if is_val else img_tr
-                lb_dir = lb_va if is_val else lb_tr
-
-                stem = f"frame_{fidx:06d}"
-                cv2.imwrite(os.path.join(img_dir, stem + ".jpg"), frame)
-
-                # YOLO-OBB format: cls x1 y1 x2 y2 x3 y3 x4 y4 (normalized)
-                lines = []
-                for ann in self.dataset.get(fidx, []):
-                    poly = getattr(ann, "poly", None)
-                    cls_id = int(getattr(ann, "cls_id", -1))
-                    if poly is None or np.asarray(poly).shape != (4, 2) or cls_id < 0:
-                        continue
-                    pts = _normalize_poly(np.asarray(poly))
-                    flat = " ".join(f"{v:.6f}" for v in pts.reshape(-1))
-                    lines.append(f"{cls_id} {flat}")
-
-                # YOLO expects a .txt per image even if empty
-                with open(os.path.join(lb_dir, stem + ".txt"), "w", encoding="utf-8") as f:
-                    f.write("\n".join(lines))
-
-                written += 1
-                self.progress.emit(
-                    f"Wrote {written}/{len(frame_indices)} samples...",
-                    0.05 + 0.6 * (i + 1) / max(len(frame_indices), 1),
-                )
-
-            cap.release()
-
-            if written == 0:
-                raise RuntimeError("No samples written. Check that the dataset has verified annotations.")
-
-            # --- Write dataset.yaml ---
-            data_yaml = os.path.join(run_dir, "dataset.yaml")
-            with open(data_yaml, "w", encoding="utf-8") as f:
-                f.write(
-                    "path: .\n"
-                    f"train: finetune_runs/run-{ts}/images/train\n"
-                    f"val: finetune_runs/run-{ts}/images/val\n"
-                    "names:\n"
-                )
-                for idx, name in enumerate(self.class_names):
-                    f.write(f"  {idx}: {name}\n")
-
-            self.progress.emit("Launching training...", 0.70)
-
-            # --- Train ---
             model = YOLO(self.base_model_path)
+
+            # --- Register ultralytics callbacks for per-epoch progress ---
+            total_epochs = self.epochs
+            worker_ref = self   # prevent garbage-collection issues in closure
+
+            def _on_fit_epoch_end(trainer):
+                """Called by ultralytics at the end of each epoch (after val)."""
+                epoch = trainer.epoch + 1
+                metrics = {}
+
+                # Collect available metrics from the trainer
+                if hasattr(trainer, "metrics") and trainer.metrics:
+                    for k, v in trainer.metrics.items():
+                        try:
+                            metrics[k] = float(v)
+                        except (TypeError, ValueError):
+                            pass
+
+                # Also grab the last training loss values
+                if hasattr(trainer, "loss_items") and trainer.loss_items is not None:
+                    loss_names = getattr(trainer, "loss_names", None)
+                    loss_vals = trainer.loss_items
+                    if hasattr(loss_vals, "cpu"):
+                        loss_vals = loss_vals.cpu().numpy()
+                    if loss_names and len(loss_names) == len(loss_vals):
+                        for name, val in zip(loss_names, loss_vals):
+                            metrics[f"train/{name}"] = float(val)
+
+                frac = epoch / total_epochs
+                worker_ref.progress.emit(f"Epoch {epoch}/{total_epochs}", frac)
+                worker_ref.epoch_metrics.emit(epoch, total_epochs, metrics)
+
+            model.add_callback("on_fit_epoch_end", _on_fit_epoch_end)
+
+            self.progress.emit("Starting training...", 0.0)
+            self.log_line.emit(f"=== Training started: {total_epochs} epochs, "
+                               f"imgsz={self.imgsz}, batch={self.batch} ===")
+
             model.train(
-                data=data_yaml,
+                data=self.data_yaml,
                 epochs=self.epochs,
                 imgsz=self.imgsz,
                 batch=self.batch,
@@ -289,7 +306,7 @@ class DetectFinetuneWorker(QtCore.QObject):
                 fliplr=0.5,
             )
 
-            # --- Locate best weights ---
+            # Locate best weights
             weights_dir = os.path.join(run_dir, "finetune", "weights")
             best_pt = os.path.join(weights_dir, "best.pt")
             if not os.path.isfile(best_pt):
@@ -299,105 +316,82 @@ class DetectFinetuneWorker(QtCore.QObject):
                 else:
                     raise RuntimeError("Training finished but no weights found.")
 
-            self.progress.emit("Training complete.", 0.99)
+            self.progress.emit("Training complete!", 1.0)
+            self.log_line.emit(f"=== Training complete — weights: {best_pt} ===")
             self.finished.emit(best_pt)
 
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
 
 
 # ---------------------------------------------------------------------------
-# Segmentation (SAM2-UNet)
+# Segmentation inference
 # ---------------------------------------------------------------------------
 
 class SegWorker(QtCore.QObject):
-    """Run binary segmentation on a single frame using SAM2-UNet.
-
-    The model operates at 512×512; output polygons are rescaled back
-    to the original image dimensions.
-
-    Signals:
-        finished(frame_idx, class_names, List[OBBOX])
-        error(str)
-    """
     finished = QtCore.Signal(object, object, object)
     error = QtCore.Signal(str)
-
-    # Input resolution expected by the model
-    MODEL_SIZE = 512
 
     def __init__(
         self,
         frame_idx: int,
         frame_bgr: np.ndarray,
         conf: float = 0.5,
+        imgsz: int = 512,
         model_path: str = SAM2_UNET_MODEL_PATH,
-        **kwargs,                       # accept (and ignore) extra keys like imgsz
     ):
         super().__init__()
         self.frame_idx = frame_idx
         self.frame_bgr = frame_bgr
         self.conf = conf
+        self.imgsz = imgsz
         self.model_path = model_path
-
-    def preprocess(self, frame_bgr: np.ndarray) -> torch.Tensor:
-        """BGR uint8 → normalized (1, 3, 512, 512) tensor."""
-        x = frame_bgr[..., ::-1].copy()          # BGR → RGB
-        transform = Compose([
-            ToTensor(),
-            Resize((self.MODEL_SIZE, self.MODEL_SIZE)),
-            Normalize(mean=[0.485, 0.456, 0.406],
-                      std=[0.229, 0.224, 0.225]),
-        ])
-        return transform(x).unsqueeze(0)          # add batch dim
 
     @QtCore.Slot()
     def run(self):
         try:
-            # Lazy-load model (cached on the class)
             if not hasattr(SegWorker, "_model"):
-                if not os.path.isfile(self.model_path):
-                    raise FileNotFoundError(f"Model not found: {self.model_path}")
                 net = SAM2UNet(
                     config="tiny",
                     sam_checkpoint_path=SAM2_CHECKPOINT_PATH,
                     freeze_encorder=True,
                 ).to("cuda")
-                lit = LitBinarySeg.load_from_checkpoint(
-                    self.model_path,
-                    net=net,
-                    deep_supervision=False,
-                    dice_use_all_outputs=False,
-                    pos_weight=200,
-                )
-                lit.eval()
-                SegWorker._model = lit.to("cuda")
+                SegWorker._model = LitBinarySeg.load_from_checkpoint(
+                    self.model_path, net=net,
+                    deep_supervision=False, dice_use_all_outputs=False, pos_weight=200,
+                ).eval().to("cuda")
 
             model = SegWorker._model
-            input_tensor = self.preprocess(self.frame_bgr).to("cuda")
+            transform = Compose([
+                Resize((self.imgsz, self.imgsz)),
+                ToTensor(),
+                Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+
+            from PIL import Image
+            pil_img = Image.fromarray(cv2.cvtColor(self.frame_bgr, cv2.COLOR_BGR2RGB))
+            orig_w, orig_h = pil_img.size
+            inp = transform(pil_img).unsqueeze(0).to("cuda")
 
             with torch.no_grad():
-                res = model(input_tensor).sigmoid()
+                out = model(inp)
+                if isinstance(out, (list, tuple)):
+                    out = out[0]
+                prob = torch.sigmoid(out).squeeze().cpu().numpy()
 
-            # Binary mask at model resolution
-            mask = (res[0, 0].cpu().numpy() > self.conf).astype(np.uint8) * 255
+            mask = (prob > self.conf).astype(np.uint8) * 255
+            mask = cv2.resize(mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
 
-            # Extract polygons at 512×512, then rescale to original image size
-            orig_h, orig_w = self.frame_bgr.shape[:2]
-            polys_512 = mask_to_polys(mask)
-
-            scale_x = orig_w / self.MODEL_SIZE
-            scale_y = orig_h / self.MODEL_SIZE
-
-            annot_polys = []
-            for p in polys_512:
-                scaled = p.copy()
-                scaled[:, 0] *= scale_x
-                scaled[:, 1] *= scale_y
-                annot_polys.append(OBBOX(poly=scaled.astype(np.float32), cls_id=0, conf=1.0))
-
-            names = ["Building"] * len(annot_polys)
-            self.finished.emit(self.frame_idx, names, annot_polys)
+            polys_np = mask_to_polys(mask)
+            poly_objs = [
+                PolyClass(poly=p.astype(np.float32), cls_id=0, conf=1.0)
+                for p in polys_np
+            ]
+            names = ["object"]
+            self.finished.emit(self.frame_idx, names, poly_objs)
 
         except Exception as e:
             self.error.emit(str(e))
@@ -408,13 +402,6 @@ class SegWorker(QtCore.QObject):
 # ---------------------------------------------------------------------------
 
 class SegFinetuneWorker(QtCore.QObject):
-    """Fine-tune the SAM2-UNet model on verified segmentation annotations.
-
-    Signals:
-        progress(str, float)   — message + progress in [0, 1]
-        finished(str)          — path to best checkpoint
-        error(str)
-    """
     progress = QtCore.Signal(str, float)
     finished = QtCore.Signal(str)
     error = QtCore.Signal(str)
@@ -425,10 +412,9 @@ class SegFinetuneWorker(QtCore.QObject):
         dataset_images_names: Dict[int, str],
         base_model_path: str,
         out_root: Optional[str] = None,
-        epochs: int = 10,
-        batch: int = 4,
+        epochs: int = 20,
+        batch: int = 8,
         val_split: float = 0.1,
-        seed: int = 1337,
     ):
         super().__init__()
         self.dataset = dataset
@@ -438,95 +424,59 @@ class SegFinetuneWorker(QtCore.QObject):
         self.epochs = int(epochs)
         self.batch = int(batch)
         self.val_split = float(val_split)
-        self.seed = int(seed)
 
     @QtCore.Slot()
     def run(self):
         try:
-            # --- Sanity checks ---
-            if not os.path.isfile(self.base_model_path):
-                raise FileNotFoundError(f"Base model not found: {self.base_model_path}")
-            if not self.dataset:
-                raise ValueError("Dataset is empty; verify annotations first.")
-
-            self.progress.emit("Preparing dataset...", 0.02)
-
-            # --- Prepare run directory ---
+            import random
             ts = time.strftime("%Y%m%d-%H%M%S")
-            exp_name = "finetune_seg"
-            run_dir = f"logs/{exp_name}/{ts}"
-            os.makedirs(run_dir, exist_ok=True)
+            run_dir = os.path.join(self.out_root, f"seg-run-{ts}")
+            img_dir = os.path.join(run_dir, "images")
+            mask_dir = os.path.join(run_dir, "masks")
+            os.makedirs(img_dir, exist_ok=True)
+            os.makedirs(mask_dir, exist_ok=True)
 
-            torch.manual_seed(self.seed)
-            np.random.seed(self.seed)
-
-            # --- Write images and masks to a dataset folder ---
-            self.progress.emit("Preparing dataset...", 0.05)
-            data_dir = f"datasets/seg_finetune/data_{ts}"
-            data_dir_images = os.path.join(data_dir, "images")
-            data_dir_masks = os.path.join(data_dir, "GT_Object")
-            os.makedirs(data_dir_images, exist_ok=True)
-            os.makedirs(data_dir_masks, exist_ok=True)
-
-            for frame_idx, polys in self.dataset.items():
-                img_src_path = self.dataset_images_names.get(frame_idx)
-                if img_src_path is None or not os.path.isfile(img_src_path):
+            self.progress.emit("Building segmentation dataset...", 0.0)
+            items = list(self.dataset.items())
+            for i, (frame_idx, polys) in enumerate(items):
+                img_path = self.dataset_images_names.get(frame_idx)
+                if img_path is None or not os.path.isfile(img_path):
                     continue
+                img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+                if img is None:
+                    continue
+                h, w = img.shape[:2]
+                mask = polys_to_mask(polys, w, h)
+                stem = f"frame{frame_idx:06d}"
+                cv2.imwrite(os.path.join(img_dir, f"{stem}.jpg"), img)
+                cv2.imwrite(os.path.join(mask_dir, f"{stem}.png"), mask)
 
-                img_dst_path = os.path.join(data_dir_images, os.path.basename(img_src_path))
-                cv2.imwrite(img_dst_path, cv2.imread(img_src_path))
+            self.progress.emit("Training segmentation model...", 0.1)
 
-                # Rasterize polygons into a binary mask
-                mask = polys_to_mask(polys, (512, 512))
-                mask_dst_path = os.path.join(data_dir_masks, f"frame_{frame_idx:06d}_mask.png")
-                cv2.imwrite(mask_dst_path, mask)
-
-            # --- Callbacks ---
-            cb_checkpoint = ModelCheckpoint(
-                monitor="val/dice",
-                dirpath=run_dir,
-                save_top_k=1,
-                mode="max",
-            )
-
-            # --- Initialize model and trainer ---
             net = SAM2UNet(
                 config="tiny",
                 sam_checkpoint_path=SAM2_CHECKPOINT_PATH,
                 freeze_encorder=True,
-            ).to("cuda")
-
+            )
             lit = LitBinarySeg.load_from_checkpoint(
-                self.base_model_path,
-                net=net,
-                deep_supervision=False,
-                dice_use_all_outputs=False,
-                pos_weight=200,
+                self.base_model_path, net=net,
+                deep_supervision=False, dice_use_all_outputs=False, pos_weight=200,
             )
-
+            dm = DataModule512Mask(img_dir=img_dir, mask_dir=mask_dir, batch_size=self.batch)
+            ckpt_cb = ModelCheckpoint(dirpath=run_dir, filename="best", monitor="val_loss", save_top_k=1)
+            logger = TensorBoardLogger(save_dir=run_dir, name="logs")
             trainer = Trainer(
-                accelerator="auto",
+                max_epochs=self.epochs,
+                accelerator="gpu",
                 devices=1,
-                max_epochs=self.epochs,         # was hardcoded to 10 — now uses self.epochs
-                logger=TensorBoardLogger(
-                    save_dir=run_dir,
-                    name=exp_name,
-                    version=f"{ts}/tensorboard",
-                ),
-                callbacks=[cb_checkpoint],
+                callbacks=[ckpt_cb],
+                logger=logger,
+                enable_progress_bar=True,
             )
-
-            data_module = DataModule512Mask(
-                dataset_path=data_dir,
-                batch_size=self.batch,
-                val_split=self.val_split,
-            )
-
-            self.progress.emit("Launching training...", 0.70)
-            trainer.fit(lit, datamodule=data_module)
-
-            self.progress.emit("Training complete.", 0.99)
-            self.finished.emit(cb_checkpoint.best_model_path)
+            trainer.fit(lit, dm)
+            best_path = ckpt_cb.best_model_path or os.path.join(run_dir, "best.ckpt")
+            self.progress.emit("Segmentation training complete!", 1.0)
+            self.finished.emit(best_path)
 
         except Exception as e:
             self.error.emit(str(e))

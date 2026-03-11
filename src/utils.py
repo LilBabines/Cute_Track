@@ -254,3 +254,11 @@ def draw_annotations(
                 cv2.putText(out, label, (x0 + 3, y0 + th + 2),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
     return out
+
+
+
+
+
+
+
+

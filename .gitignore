@@ -236,3 +236,5 @@ checkpoints/
 *.safetensors
 
 runs/
+
+projects/
