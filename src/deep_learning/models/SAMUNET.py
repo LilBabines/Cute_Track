@@ -396,7 +396,7 @@ class LitBinarySeg(L.LightningModule):
         self.train_dice.reset()
 
     def validation_step(self, batch, batch_idx):
-        self._step(batch, "val")
+        return self._step(batch, "val")
 
     def on_validation_epoch_end(self):
         dice = self.val_dice.compute()

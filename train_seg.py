@@ -1,4 +1,3 @@
-
 from src.deep_learning.models.SAMUNET import LitBinarySeg, SAM2UNet
 from src.deep_learning.models.SAMUNext import SAM2UNeXT
 from lightning.pytorch.callbacks import ModelCheckpoint
@@ -16,7 +15,7 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     np.random.seed(42)
 
-    exp_name = "samunext"
+    exp_name = "dynamics_train_val"
 
     #define callbacks
     cb_checkpoint = ModelCheckpoint(
@@ -25,11 +24,11 @@ if __name__ == "__main__":
         save_top_k=1,
         mode="max",
     )
-    # record_D = Record_train_dynamics(save_dir="logs/", name=exp_name)
+    record_D = Record_train_dynamics(save_dir="logs/", name=exp_name)
 
     #initialize model, litmodule, trainer, datamodule
-    # net = SAM2UNet(config="tiny", sam_checkpoint_path="src/sam2/checkpoints/sam2.1_hiera_tiny.pt", freeze_encorder = False).to("cuda")
-    net = SAM2UNeXT(checkpoint_path="models/sam2_hiera_large.pt",dinov2_path="models/model.safetensors").to("cuda")
+    net = SAM2UNet(config="tiny", sam_checkpoint_path="src/sam2/checkpoints/sam2.1_hiera_tiny.pt", freeze_encorder = False).to("cuda")
+    # net = SAM2UNeXT(checkpoint_path="models/sam2_hiera_large.pt",dinov2_path="models/model.safetensors").to("cuda")
 
     lit = LitBinarySeg(
         net,
@@ -38,14 +37,15 @@ if __name__ == "__main__":
         pos_weight=30                   # utile si classe rare
     )
     trainer = Trainer(accelerator="auto", devices=1, 
-                      max_epochs=100,
-                      log_every_n_steps=50,
+                      max_epochs=500,
+                      log_every_n_steps=10,
                       logger=TensorBoardLogger(save_dir="logs/", name=exp_name, version="tensorboard"),
-                      callbacks=[cb_checkpoint,])# record_D
+                      num_sanity_val_steps = 0, 
+                      callbacks=[cb_checkpoint, record_D])# 
     
     data_module = DataModule512Mask(
         dataset_path="datasets/new_anot/datasets_new",
-        batch_size=8,
+        batch_size=16,
         num_workers=8,
         keep_pourcent=1
     )

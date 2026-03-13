@@ -230,3 +230,4 @@ checkpoints/
 *logs/
 
 *.safetensors
+*.csv
