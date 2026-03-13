@@ -12,48 +12,53 @@ import matplotlib.pyplot as plt
 
 
 if __name__ == "__main__":
-    torch.manual_seed(42)
-    np.random.seed(42)
 
-    exp_name = "dynamics_train_val"
+    for kfold in range(10):
 
-    #define callbacks
-    cb_checkpoint = ModelCheckpoint(
-        monitor="val/dice",
-        dirpath=f"logs/{exp_name}/",
-        save_top_k=1,
-        mode="max",
-    )
-    record_D = Record_train_dynamics(save_dir="logs/", name=exp_name)
+        torch.manual_seed(42)
+        np.random.seed(42)
 
-    #initialize model, litmodule, trainer, datamodule
-    net = SAM2UNet(config="tiny", sam_checkpoint_path="src/sam2/checkpoints/sam2.1_hiera_tiny.pt", freeze_encorder = False).to("cuda")
-    # net = SAM2UNeXT(checkpoint_path="models/sam2_hiera_large.pt",dinov2_path="models/model.safetensors").to("cuda")
+        exp_name = f"dynamics_train_val_fold_{kfold}"
 
-    lit = LitBinarySeg(
-        net,
-        deep_supervision=False,
-        dice_use_all_outputs=False,      # mets True si tu veux la Dice moyenne (out,out1,out2)
-        pos_weight=30                   # utile si classe rare
-    )
-    trainer = Trainer(accelerator="auto", devices=1, 
-                      max_epochs=500,
-                      log_every_n_steps=10,
-                      logger=TensorBoardLogger(save_dir="logs/", name=exp_name, version="tensorboard"),
-                      num_sanity_val_steps = 0, 
-                      callbacks=[cb_checkpoint, record_D])# 
-    
-    data_module = DataModule512Mask(
-        dataset_path="datasets/new_anot/datasets_new",
-        batch_size=16,
-        num_workers=8,
-        keep_pourcent=1
-    )
+        #define callbacks
+        cb_checkpoint = ModelCheckpoint(
+            monitor="val/dice",
+            dirpath=f"logs/{exp_name}/",
+            save_top_k=1,
+            mode="max",
+        )
+        record_D = Record_train_dynamics(save_dir="logs/", name=exp_name)
 
-    trainer.fit(lit, datamodule=data_module)
+        #initialize model, litmodule, trainer, datamodule
+        net = SAM2UNet(config="tiny", sam_checkpoint_path="src/sam2/checkpoints/sam2.1_hiera_tiny.pt", freeze_encorder = False).to("cuda")
+        # net = SAM2UNeXT(checkpoint_path="models/sam2_hiera_large.pt",dinov2_path="models/model.safetensors").to("cuda")
 
-    best_model_path = cb_checkpoint.best_model_path
-    print(f"Best model path: {best_model_path}")
+        lit = LitBinarySeg(
+            net,
+            deep_supervision=False,
+            dice_use_all_outputs=False,      # mets True si tu veux la Dice moyenne (out,out1,out2)
+            pos_weight=30                   # utile si classe rare
+        )
+        trainer = Trainer(accelerator="auto", devices=1, 
+                        max_epochs=150,
+                        log_every_n_steps=10,
+                        logger=TensorBoardLogger(save_dir="logs/", name=exp_name, version="tensorboard"),
+                        num_sanity_val_steps = 0, 
+                        callbacks=[cb_checkpoint, record_D])# 
+        
+        data_module = DataModule512Mask(
+            dataset_path="datasets/new_anot/datasets_new",
+            batch_size=16,
+            num_workers=8,
+            keep_pourcent=1,
+            kfold=10,
+            num_fold=kfold
+        )
+
+        trainer.fit(lit, datamodule=data_module)
+
+        best_model_path = cb_checkpoint.best_model_path
+        print(f"Best model path: {best_model_path}")
 
     # module = LitBinarySeg.load_from_checkpoint(best_model_path,net=net).to("cuda")
     # lit.eval()

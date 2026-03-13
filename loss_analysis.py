@@ -146,7 +146,7 @@ if __name__ == "__main__":
     N_SUSPECT = 10
     DATASET_PATH = "datasets/new_anot/datasets_new"  # ← adapte ici
 
-    csv_path = "logs/dynamics_train_val/train_dynamics/metrics.csv"
+    csv_path = "logs/dynamics_train_val/val_dynamics/metrics.csv"
     images_dir = f"{DATASET_PATH}/images"
     masks_dir = f"{DATASET_PATH}/GT_Object"
 
