@@ -231,3 +231,7 @@ checkpoints/
 
 *.safetensors
 *.csv
+
+results*
+
+*.png

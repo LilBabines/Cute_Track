@@ -8,3 +8,13 @@
 5.    cd checkpoints && ./download_ckpts.sh
 
 some conflicts between openCV and pyside may occur, on ubuntu `sudo apt install libxcb-cursor0` fix it
+
+
+
+python predict_seg.py \
+    --images ./datasets/new_anot/datasets_new/images \
+    --gt     ./datasets/new_anot/datasets_new/GT_Object \
+    --output ./results_save_sarah \
+    --ckpt   ./logs/dynamics_train_val_fold_0/epoch=37-step=6080.ckpt \
+    --threshold 0.5 \
+    --img-size 512 512
